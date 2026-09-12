@@ -1,0 +1,72 @@
+# Changelog
+
+All notable changes to `de-shell`. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), the versioning is
+[semver](https://semver.org/) with the 0.x caveat: a breaking change to the
+sidecar protocol bumps the minor.
+
+## [Unreleased]
+
+### Fixed
+- `closeApp` (testing) removes the launch's temp profile directory on every
+  path, and `launchApp` reports it as `profileDir`. Each e2e launch used to
+  leave a `<appId>-e2e-profile-*` directory behind. `pythonEnv.test.ts` now
+  removes the directories it makes.
+
+## [0.2.1] - 2026-09-02
+
+Ground Crew's shell work from after the merge base, so it can move onto the
+package too.
+
+### Added
+- `createStdoutDemux` (main): the sidecar's stdout demuxer as a chunk-list
+  accumulator that copies each byte once. The inline parser re-copied the
+  whole buffered prefix per chunk, O(N^2/chunkSize) while a large frame
+  streamed in (11.9 s per 64 MB frame at 64 KiB chunks). A malformed
+  `PLOTAPP:` line is now reported on stderr rather than swallowed.
+- `createSizeReporter` (renderer): `FigureFrame` skips the zero-size first
+  layout and any resize whose rounded size is unchanged, and holds its
+  `onResize` in a ref so an inline callback no longer re-runs the effect
+  (measured at ~1,500 sends/s over constant geometry before).
+- `attachFigure` (renderer): figure registration is owned by an effect and
+  re-registers on every run, so React StrictMode's double-invoke no longer
+  leaves a figure registered nowhere with its pane black.
+- `PIN_SCROLL`: every figure document undoes the focus-scroll that shifted a
+  fresh pane by half its overflow on first hover.
+
+### Changed
+- anyplotlib floor raised to 0.8.0, for its fix to a tiled image born on a
+  placeholder rendering solid black.
+
+## [0.2.0] — 2026-09-02
+
+The first release as its own package. Until now the shell lived as a vendored
+copy inside each of SpyDE, Ground Crew and Autopilot, and the three had
+diverged.
+
+### Added
+- **One package.** The TypeScript half (`de_shell/js`: the Electron main
+  process, the preload bridge, the React renderer kernel, the Playwright
+  harness) ships inside the wheel, so `pip install -U de-shell` moves both
+  halves of the sidecar protocol together. `python -m de_shell.js` prints where
+  the tree is; apps link it into their Electron project.
+- From SpyDE 0.4.3: the problem reporter (`errorReport`, `problemLog`,
+  `sentryEnvelope`), `recentBackendOutput`, workspace-member wheels in the
+  environment setup, an update handoff that tree-kills the sidecar first,
+  `run_on_worker`'s in-flight count and `ComputeHandle` for cancelling a
+  superseded compute.
+- From Ground Crew: the sidecar spawn-error trap, a 5 s tree-kill grace, a
+  resolved `uv` path, the open-directory dialog channel, `_pin_tile_band` for
+  large stills, JSON emit that never writes bare `NaN`, harness hardening, and
+  the unit tests for all of it.
+- From Autopilot: the close handler forgets only its own child process, a
+  report for malformed protocol messages, `useFigureEventForwarding`, and a
+  `LOG_CLEAR` action in the renderer state.
+
+### Changed
+- License: MIT (the vendored copies were GPL-3.0-or-later inside SpyDE).
+- Line endings are LF throughout, enforced by `.gitattributes`.
+
+[Unreleased]: https://github.com/directelectron/de-shell/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/directelectron/de-shell/releases/tag/v0.2.1
+[0.2.0]: https://github.com/directelectron/de-shell/releases/tag/v0.2.0

@@ -30,7 +30,7 @@ function appRequire(name) {
 }
 const { _electron: electron } = appRequire('@playwright/test')
 const { spawnSync } = require('child_process')
-const { mkdtempSync } = require('fs')
+const { mkdtempSync, rmSync } = require('fs')
 const { join } = require('path')
 const { tmpdir } = require('os')
 
@@ -51,6 +51,7 @@ async function launchApp(opts) {
     env = {}, timeout = 60_000,
   } = opts
   if (!appDir || !appId) throw new Error('launchApp needs { appDir, appId }')
+  const profileDir = mkdtempSync(join(tmpdir(), `${appId}-e2e-profile-`))
 
   const app = await electron.launch({
     // Resolve Electron from the APP's tree, not Playwright's. Without an
@@ -63,7 +64,7 @@ async function launchApp(opts) {
     executablePath: require(require.resolve('electron/index.js', { paths: [appDir] })),
     args: [
       join(appDir, 'out', 'main', 'index.js'),
-      `--user-data-dir=${mkdtempSync(join(tmpdir(), `${appId}-e2e-profile-`))}`,
+      `--user-data-dir=${profileDir}`,
     ],
     env: { ...process.env, ...env },
   })
@@ -80,9 +81,9 @@ async function launchApp(opts) {
   for (const type of readyMessages) await backend.waitForMessage(type, timeout)
 
   return {
-    app, page, backend, jsErrors,
+    app, page, backend, jsErrors, profileDir,
     assertNoJsErrors: () => assertNoJsErrors(jsErrors),
-    close: (opts) => closeApp(app, opts),
+    close: (opts) => closeApp(app, { profileDir, ...opts }),
   }
 }
 
@@ -109,23 +110,37 @@ async function firstWindowWithLog(app, logBuffer, timeout = 60_000) {
  * runner's timeout, leaving an Electron tree alive that (for a DE app) still
  * owns the server's single connection — every later launch then hangs on a
  * connection that cannot be made. Returns 'closed' | 'killed' | 'noop' so a
- * caller can log what teardown actually did.
+ * caller can log what teardown actually did. `opts.profileDir` (the launch's
+ * temp profile) is removed once the process is down, on every path.
  */
 async function closeApp(app, opts = {}) {
-  const { timeout = 15_000, killTree = hardKillTree } = opts
-  if (!app) return 'noop'
-  const pid = app.process()?.pid
-  const closed = await new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeout)
-    timer.unref?.()
-    Promise.resolve()
-      .then(() => app.close())
-      .then(() => { clearTimeout(timer); resolve(true) },
-            () => { clearTimeout(timer); resolve(false) })
-  })
-  if (closed) return 'closed'
-  if (pid) killTree(pid)
-  return pid ? 'killed' : 'noop'
+  const { timeout = 15_000, killTree = hardKillTree, profileDir = null } = opts
+  try {
+    if (!app) return 'noop'
+    const pid = app.process()?.pid
+    const closed = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeout)
+      timer.unref?.()
+      Promise.resolve()
+        .then(() => app.close())
+        .then(() => { clearTimeout(timer); resolve(true) },
+              () => { clearTimeout(timer); resolve(false) })
+    })
+    if (closed) return 'closed'
+    if (pid) killTree(pid)
+    return pid ? 'killed' : 'noop'
+  } finally {
+    if (profileDir) removeProfileDir(profileDir)
+  }
+}
+
+/** Remove a launch's temp profile. Retries cover a handle Chromium is still
+ *  letting go of on Windows; a directory that still will not go is left for the
+ *  OS rather than failing the spec's teardown. */
+function removeProfileDir(dir) {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+  } catch { /* left behind; not the spec's failure */ }
 }
 
 /** Force-kill `pid` AND everything under it (the Python sidecar and its
@@ -240,5 +255,5 @@ async function countColorPixels(page, kind) {
 
 module.exports = {
   launchApp, createBackend, countColorPixels, assertNoJsErrors, errorLines,
-  firstWindowWithLog, closeApp, hardKillTree,
+  firstWindowWithLog, closeApp, hardKillTree, removeProfileDir,
 }

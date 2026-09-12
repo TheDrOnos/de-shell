@@ -15,6 +15,9 @@
  */
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
+const { mkdtempSync, existsSync, writeFileSync } = require('fs')
+const { join } = require('path')
+const { tmpdir } = require('os')
 const { firstWindowWithLog, closeApp } = require('./harness.cjs')
 
 test('a missing first window reports the backend log, not a bare timeout', async () => {
@@ -70,4 +73,31 @@ test('a close that rejects still hard-kills the tree', async () => {
 test('closeApp tolerates a missing app', async () => {
   assert.equal(await closeApp(null), 'noop')
   assert.equal(await closeApp(undefined), 'noop')
+})
+
+/** A stand-in for the launch's --user-data-dir, with something inside it. */
+function fakeProfileDir() {
+  const dir = mkdtempSync(join(tmpdir(), 'harness-test-profile-'))
+  writeFileSync(join(dir, 'Preferences'), '{}')
+  return dir
+}
+
+test('a clean close removes the profile dir', async () => {
+  const profileDir = fakeProfileDir()
+  const app = { process: () => ({ pid: 4242 }), close: async () => {} }
+  assert.equal(await closeApp(app, { timeout: 1000, killTree: () => {}, profileDir }), 'closed')
+  assert.equal(existsSync(profileDir), false, 'profile dir left behind')
+})
+
+test('a hard-killed close removes the profile dir too', async () => {
+  const profileDir = fakeProfileDir()
+  const app = { process: () => ({ pid: 4242 }), close: () => new Promise(() => {}) }
+  assert.equal(await closeApp(app, { timeout: 100, killTree: () => {}, profileDir }), 'killed')
+  assert.equal(existsSync(profileDir), false, 'profile dir left behind')
+})
+
+test('closeApp with no app still removes the profile dir', async () => {
+  const profileDir = fakeProfileDir()
+  assert.equal(await closeApp(null, { profileDir }), 'noop')
+  assert.equal(existsSync(profileDir), false, 'profile dir left behind')
 })
