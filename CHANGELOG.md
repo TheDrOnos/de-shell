@@ -7,6 +7,12 @@ sidecar protocol bumps the minor.
 
 ## [Unreleased]
 
+### Fixed
+- `closeApp` (testing) removes the launch's temp profile directory on every
+  path, and `launchApp` reports it as `profileDir`. Each e2e launch used to
+  leave a `<appId>-e2e-profile-*` directory behind. `pythonEnv.test.ts` now
+  removes the directories it makes.
+
 ## [0.2.1] - 2026-09-02
 
 Ground Crew's shell work from after the merge base, so it can move onto the
