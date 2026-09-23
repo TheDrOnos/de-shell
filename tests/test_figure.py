@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from de_shell.plotting.figure import FigureView, robust_levels
+from de_shell.plotting.figure import FigureView, fill_iframe_html, robust_levels
 
 
 class TestRobustLevels:
@@ -216,3 +216,18 @@ class TestOverlays:
 
     def test_texts_on_a_closed_figure_are_none(self):
         assert FigureView(0).add_texts([[0, 0]], ["x"]) is None
+
+
+class TestReadout:
+    def test_the_pill_can_be_hidden_for_the_host_to_draw_its_own(self):
+        v = FigureView(0)
+        v.open((64, 64))
+        assert v.set_readout_visible(False) is True
+        assert v._plot2d._state["readout_visible"] is False
+
+    def test_hiding_the_pill_on_a_closed_figure_is_a_no_op(self):
+        assert FigureView(0).set_readout_visible(False) is False
+
+    def test_every_figure_frame_relays_its_readout_to_the_host(self):
+        head = fill_iframe_html("<head></head><body></body>").split("<body>")[0]
+        assert "apl:readout" in head and "apl_readout" in head

@@ -140,6 +140,15 @@ PIN_SCROLL = (
     "},{capture:true,passive:true})</script>"
 )
 
+#: Relays anyplotlib's hover readout (`apl:readout`, which fires whether or not
+#: the pill is shown) to the host page, for `FigureFrame`'s `onReadout`.
+#: `info` is null when the cursor leaves the image.
+RELAY_READOUT = (
+    "<script>document.addEventListener('apl:readout',function(e){"
+    "if(parent!==window)parent.postMessage({type:'apl_readout',info:e.detail},'*')"
+    "})</script>"
+)
+
 
 def fill_iframe_html(html: str, *, background: str = FIGURE_BACKGROUND,
                      extra_head: str = "") -> str:
@@ -161,7 +170,8 @@ def fill_iframe_html(html: str, *, background: str = FIGURE_BACKGROUND,
              f"#widget-root{{background:{background} !important;"
              "width:100% !important;height:100% !important;display:block !important}"
              "</style>")
-    return html.replace("<body>", style + PIN_SCROLL + extra_head + "<body>", 1)
+    return html.replace("<body>",
+                        style + PIN_SCROLL + RELAY_READOUT + extra_head + "<body>", 1)
 
 
 class FigureView:
@@ -452,6 +462,19 @@ class FigureView:
             return True
         except Exception as e:
             log.debug("set_clim(%s, %s) failed: %s", vmin, vmax, e)
+            return False
+
+    def set_readout_visible(self, visible: bool) -> bool:
+        """Show or hide the on-image hover pill. Hidden, the readout still reaches
+        the host through `FigureFrame`'s `onReadout`, so an app can print it in
+        its own units."""
+        if not self.is_open:
+            return False
+        try:
+            self._plot2d.set_readout_visible(bool(visible))
+            return True
+        except Exception as e:
+            log.debug("set_readout_visible(%s) failed: %s", visible, e)
             return False
 
     def on_event(self, *event_types: str):
