@@ -42,7 +42,10 @@ dependencies = [
     # the frame's shape, given a tile source on its zeros placeholder, then
     # painted. On 0.7.3 a state push landing between the open and the first
     # frame could leave the pane showing the placeholder.
-    "anyplotlib>=0.8.0",
+    #
+    # 0.10.0 for the hover readout's `apl:readout` event and `set_readout_visible`
+    # (0.9.0), and `add_texts`' `outline_color` halo (0.10.0).
+    "anyplotlib>=0.10.0",
     "pyyaml",
 ]
 
