@@ -574,6 +574,42 @@ class FigureView:
                 log.warning("could not observe line widget: %s", e)
         return w
 
+    def add_rectangle_widget(self, *, x: float, y: float, w: float, h: float,
+                             color: str = "#00e5ff", on_change=None,
+                             max_extent=None, show_handles: bool = True,
+                             linewidth: float = 2):
+        """A draggable rectangle overlay. Returns the widget, or None.
+
+        `x, y` is the top-left corner. `max_extent` (a scalar, or
+        `(max_w, max_h)`) stops growth at the cap while a corner is dragged.
+        `on_change(x, y, w, h)` fires when a drag settles.
+        """
+        if not self.is_open:
+            return None
+        try:
+            rect = self._plot2d.add_rectangle_widget(
+                x=float(x), y=float(y), w=float(w), h=float(h), color=color,
+                linewidth=float(linewidth), show_handles=bool(show_handles),
+                max_extent=max_extent)
+        except Exception as e:
+            log.warning("could not add rectangle widget: %s", e)
+            return None
+
+        def _settled(_event, _w=rect):
+            try:
+                if on_change is not None:
+                    on_change(float(_w.x), float(_w.y),
+                              float(_w.w), float(_w.h))
+            except Exception as e:
+                log.debug("rectangle widget callback failed: %s", e)
+
+        if on_change is not None:
+            try:
+                rect.add_event_handler(_settled, "pointer_up")
+            except Exception as e:
+                log.warning("could not observe rectangle widget: %s", e)
+        return rect
+
     @staticmethod
     def set_widget_geometry(widget, **geometry) -> bool:
         """Move an overlay from Python. Returns whether it landed.

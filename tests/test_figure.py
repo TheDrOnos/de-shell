@@ -156,3 +156,50 @@ class TestTileQuantisationBand:
     def test_small_frame_stays_untiled_and_unaffected(self):
         v, _ = self._open_and_show((64, 64))
         assert not v._plot2d._state.get("tile_enabled")
+
+
+class TestOverlays:
+    """Widgets and labels on a real, open figure."""
+
+    @staticmethod
+    def _open():
+        v = FigureView(0, title="t")
+        v.open((64, 64))
+        return v
+
+    def test_a_rectangle_carries_its_geometry_style_and_cap(self):
+        w = self._open().add_rectangle_widget(
+            x=1, y=2, w=3, h=4, color="#123456", max_extent=10,
+            show_handles=False, linewidth=1)
+        assert (w.x, w.y, w.w, w.h) == (1.0, 2.0, 3.0, 4.0)
+        assert w.color == "#123456" and w.linewidth == 1.0
+        assert w.show_handles is False and (w.max_w, w.max_h) == (10.0, 10.0)
+
+    def test_a_rectangle_reports_where_a_drag_settles(self):
+        heard = []
+        w = self._open().add_rectangle_widget(
+            x=1, y=2, w=3, h=4, on_change=lambda *g: heard.append(g))
+        w._update_from_js({"x": 5.0, "y": 6.0}, "pointer_move")
+        assert heard == []                    # once per drag, not per frame
+        w._update_from_js({"w": 7.0, "h": 8.0}, "pointer_up")
+        assert heard == [(5.0, 6.0, 7.0, 8.0)]
+
+    def test_a_rectangle_moved_from_python_lands_without_a_callback(self):
+        heard = []
+        w = self._open().add_rectangle_widget(
+            x=1, y=2, w=3, h=4, on_change=lambda *g: heard.append(g))
+        assert FigureView.set_widget_geometry(w, x=9, y=9, w=5, h=5)
+        assert (w.x, w.y, w.w, w.h) == (9.0, 9.0, 5.0, 5.0) and heard == []
+
+    def test_a_rectangle_on_a_closed_figure_is_none(self):
+        assert FigureView(0).add_rectangle_widget(x=0, y=0, w=1, h=1) is None
+
+    def test_a_refused_rectangle_is_none_and_a_warning(self, monkeypatch, caplog):
+        v = self._open()
+
+        def boom(**_kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(v._plot2d, "add_rectangle_widget", boom)
+        assert v.add_rectangle_widget(x=0, y=0, w=1, h=1) is None
+        assert "rectangle" in caplog.text
