@@ -7,6 +7,20 @@ sidecar protocol bumps the minor.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-22
+
+### Added
+- `FigureView.add_rectangle_widget`: a draggable rectangle with an optional
+  `max_extent` size cap; `on_change(x, y, w, h)` fires when a drag settles.
+- `FigureView.add_texts`: text labels at image-pixel positions, with an
+  optional halo; the same `name` replaces them in place.
+- `FigureView.set_readout_visible` and `FigureFrame`'s `onReadout`: every
+  figure frame relays anyplotlib's hover readout to the host page, so an app
+  can hide the on-image pill and print the position and value in its own units.
+
+### Changed
+- anyplotlib floor raised to 0.10.0, for the readout event and text halos.
+
 ## [0.2.1] - 2026-09-02
 
 Ground Crew's shell work from after the merge base, so it can move onto the

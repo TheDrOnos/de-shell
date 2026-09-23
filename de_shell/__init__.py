@@ -20,6 +20,6 @@ from __future__ import annotations
 
 #: The package version — the one place it is written. pyproject.toml reads it
 #: (dynamic version) and the release workflow refuses a tag that disagrees.
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = ["ipc", "log_stream", "process_guard", "debug_flags", "compute"]
