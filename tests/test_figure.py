@@ -203,3 +203,16 @@ class TestOverlays:
         monkeypatch.setattr(v._plot2d, "add_rectangle_widget", boom)
         assert v.add_rectangle_widget(x=0, y=0, w=1, h=1) is None
         assert "rectangle" in caplog.text
+
+    def test_texts_are_drawn_and_a_name_replaces_them_in_place(self):
+        v = self._open()
+        v.add_texts([[4, 5]], ["edge (auto)"], name="labels",
+                    outline_color="#000000")
+        g = v.add_texts([[6, 7]], ["noise"], name="labels")
+        texts = v._plot2d.markers["texts"]
+        assert len(texts) == 1 and g._data["texts"] == ["noise"]
+        v.remove_widget(g)
+        assert "labels" not in texts
+
+    def test_texts_on_a_closed_figure_are_none(self):
+        assert FigureView(0).add_texts([[0, 0]], ["x"]) is None

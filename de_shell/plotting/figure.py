@@ -610,6 +610,24 @@ class FigureView:
                 log.warning("could not observe rectangle widget: %s", e)
         return rect
 
+    def add_texts(self, offsets, texts, *, name: str | None = None,
+                  color: str = "#ffffff", fontsize: int = 12,
+                  fontweight: str = "normal", outline_color: str | None = None):
+        """Text labels at image-pixel positions (top-left anchors). Returns the
+        group, or None. The same `name` again replaces it in place;
+        `remove_widget` drops it. `outline_color` draws a legibility halo.
+        """
+        if not self.is_open:
+            return None
+        try:
+            return self._plot2d.add_texts(
+                offsets, [str(t) for t in texts], name=name, color=color,
+                fontsize=fontsize, fontweight=fontweight,
+                outline_color=outline_color)
+        except Exception as e:
+            log.warning("could not add texts: %s", e)
+            return None
+
     @staticmethod
     def set_widget_geometry(widget, **geometry) -> bool:
         """Move an overlay from Python. Returns whether it landed.
