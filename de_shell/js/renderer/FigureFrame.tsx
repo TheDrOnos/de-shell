@@ -24,7 +24,7 @@
  * the host page needs `script-src … blob:` for anyplotlib's ESM boot.
  */
 import React, { useEffect, useRef } from 'react'
-import { attachFigure, type FigureBridge } from './figureBridge'
+import { attachFigure, readoutListener, type FigureBridge, type ReadoutInfo } from './figureBridge'
 import { createSizeReporter } from './sizeReporter'
 
 export interface FigureFrameProps {
@@ -37,13 +37,16 @@ export interface FigureFrameProps {
   title?: string
   /** Called with the frame's pixel size whenever it changes. */
   onResize?: (width: number, height: number) => void
+  /** The hover readout, on the shown grid; null when the cursor leaves. Pair it
+   *  with `FigureView.set_readout_visible(False)` to replace the on-image pill. */
+  onReadout?: (info: ReadoutInfo | null) => void
   className?: string
   style?: React.CSSProperties
   'data-testid'?: string
 }
 
 export function FigureFrame({
-  bridge, figId, html, fileUrl, title, onResize, className, style,
+  bridge, figId, html, fileUrl, title, onResize, onReadout, className, style,
   'data-testid': testId,
 }: FigureFrameProps) {
   const ref = useRef<HTMLIFrameElement | null>(null)
@@ -69,6 +72,16 @@ export function FigureFrame({
     const ro = new ResizeObserver(send)
     ro.observe(el)
     return () => ro.disconnect()
+  }, [figId])
+
+  // In a ref for the same reason as onResize: an inline prop must not re-run this.
+  const onReadoutRef = useRef(onReadout)
+  onReadoutRef.current = onReadout
+  useEffect(() => {
+    const listen = readoutListener(() => ref.current?.contentWindow,
+                                   (info) => onReadoutRef.current?.(info))
+    window.addEventListener('message', listen)
+    return () => window.removeEventListener('message', listen)
   }, [figId])
 
   // REGISTRATION IS OWNED BY AN EFFECT, not by the ref callback alone, and it

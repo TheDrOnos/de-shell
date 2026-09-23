@@ -11,7 +11,7 @@
 export {
   createFigureBridge, useFigureBridge, useFigureEventForwarding,
 } from './figureBridge.react'
-export type { FigureBridge, BinaryFrame, RefLike } from './figureBridge'
+export type { FigureBridge, BinaryFrame, RefLike, ReadoutInfo } from './figureBridge'
 
 export { FigureFrame } from './FigureFrame'
 export type { FigureFrameProps } from './FigureFrame'

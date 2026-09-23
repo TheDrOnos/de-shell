@@ -10,7 +10,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { attachFigure, createFigureBridge } from './figureBridge.ts'
+import { attachFigure, createFigureBridge, readoutListener } from './figureBridge.ts'
 
 /** A stand-in iframe that records what was posted into it. */
 function fakeIframe(testid = 'frame') {
@@ -243,5 +243,33 @@ describe('attachFigure — the mount lifecycle a figure has to survive', () => {
     bridge.registerIframe('f1', frame.el)
     attachFigure(bridge, 'f1', null)()
     assert.equal(bridge.iframes.current.get('f1'), frame.el)
+  })
+})
+
+describe('readoutListener — one frame\'s relayed readout', () => {
+  const mine = {} as Window
+  const other = {} as Window
+  const info = { col: 3, row: 4, value: 7.5, exact: true, text: 'x:3  y:4  v:7.5' }
+  const msg = (data: unknown, source: unknown) =>
+    ({ data, source }) as unknown as MessageEvent
+
+  test('the frame\'s readout reaches the host, and null clears it', () => {
+    const heard: unknown[] = []
+    const listen = readoutListener(() => mine, (i) => { heard.push(i) })
+    listen(msg({ type: 'apl_readout', info }, mine))
+    listen(msg({ type: 'apl_readout', info: null }, mine))
+    assert.deepEqual(heard, [info, null])
+  })
+
+  test('another frame\'s readout, another message, or no frame is ignored', () => {
+    // A figure mounted twice: each mount hears only its own iframe.
+    const heard: unknown[] = []
+    readoutListener(() => mine, (i) => { heard.push(i) })(
+      msg({ type: 'apl_readout', info }, other))
+    readoutListener(() => mine, (i) => { heard.push(i) })(
+      msg({ type: 'awi_event', figId: 'f1', data: '{}' }, mine))
+    readoutListener(() => null, (i) => { heard.push(i) })(
+      msg({ type: 'apl_readout', info }, mine))
+    assert.deepEqual(heard, [])
   })
 })
