@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -140,6 +141,15 @@ PIN_SCROLL = (
     "},{capture:true,passive:true})</script>"
 )
 
+#: Relays anyplotlib's hover readout (`apl:readout`, which fires whether or not
+#: the pill is shown) to the host page, for `FigureFrame`'s `onReadout`.
+#: `info` is null when the cursor leaves the image.
+RELAY_READOUT = (
+    "<script>document.addEventListener('apl:readout',function(e){"
+    "if(parent!==window)parent.postMessage({type:'apl_readout',info:e.detail},'*')"
+    "})</script>"
+)
+
 
 def fill_iframe_html(html: str, *, background: str = FIGURE_BACKGROUND,
                      extra_head: str = "") -> str:
@@ -161,7 +171,8 @@ def fill_iframe_html(html: str, *, background: str = FIGURE_BACKGROUND,
              f"#widget-root{{background:{background} !important;"
              "width:100% !important;height:100% !important;display:block !important}"
              "</style>")
-    return html.replace("<body>", style + PIN_SCROLL + extra_head + "<body>", 1)
+    return html.replace("<body>",
+                        style + PIN_SCROLL + RELAY_READOUT + extra_head + "<body>", 1)
 
 
 class FigureView:
@@ -454,6 +465,19 @@ class FigureView:
             log.debug("set_clim(%s, %s) failed: %s", vmin, vmax, e)
             return False
 
+    def set_readout_visible(self, visible: bool) -> bool:
+        """Show or hide the on-image hover pill. Hidden, the readout still reaches
+        the host through `FigureFrame`'s `onReadout`, so an app can print it in
+        its own units."""
+        if not self.is_open:
+            return False
+        try:
+            self._plot2d.set_readout_visible(bool(visible))
+            return True
+        except Exception as e:
+            log.debug("set_readout_visible(%s) failed: %s", visible, e)
+            return False
+
     def on_event(self, *event_types: str):
         """Register a handler for anyplotlib pointer/key events on this figure.
 
@@ -573,6 +597,61 @@ class FigureView:
             except Exception as e:
                 log.warning("could not observe line widget: %s", e)
         return w
+
+    def add_rectangle_widget(self, *, x: float, y: float, w: float, h: float,
+                             color: str = "#00e5ff", on_change=None,
+                             max_extent=None, show_handles: bool = True,
+                             linewidth: float = 2):
+        """A draggable rectangle overlay. Returns the widget, or None.
+
+        `x, y` is the top-left corner. `max_extent` (a scalar, or
+        `(max_w, max_h)`) stops growth at the cap while a corner is dragged.
+        `on_change(x, y, w, h)` fires when a drag settles.
+        """
+        if not self.is_open:
+            return None
+        try:
+            rect = self._plot2d.add_rectangle_widget(
+                x=float(x), y=float(y), w=float(w), h=float(h), color=color,
+                linewidth=float(linewidth), show_handles=bool(show_handles),
+                max_extent=max_extent)
+        except Exception as e:
+            log.warning("could not add rectangle widget: %s", e)
+            return None
+
+        def _settled(_event, _w=rect):
+            try:
+                if on_change is not None:
+                    on_change(float(_w.x), float(_w.y),
+                              float(_w.w), float(_w.h))
+            except Exception as e:
+                log.debug("rectangle widget callback failed: %s", e)
+
+        if on_change is not None:
+            try:
+                rect.add_event_handler(_settled, "pointer_up")
+            except Exception as e:
+                log.warning("could not observe rectangle widget: %s", e)
+        return rect
+
+    def add_texts(self, offsets, texts, *, name: str | None = None,
+                  color: str | Sequence[str] = "#ffffff", fontsize: int = 12,
+                  fontweight: str = "normal", outline_color: str | None = None):
+        """Text labels at image-pixel positions (top-left anchors). Returns the
+        group, or None. The same `name` again replaces it in place;
+        `remove_widget` drops it. `color` is one colour or one per text.
+        `outline_color` draws a legibility halo.
+        """
+        if not self.is_open:
+            return None
+        try:
+            return self._plot2d.add_texts(
+                offsets, [str(t) for t in texts], name=name, color=color,
+                fontsize=fontsize, fontweight=fontweight,
+                outline_color=outline_color)
+        except Exception as e:
+            log.warning("could not add texts: %s", e)
+            return None
 
     @staticmethod
     def set_widget_geometry(widget, **geometry) -> bool:

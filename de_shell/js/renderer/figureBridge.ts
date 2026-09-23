@@ -90,6 +90,36 @@ export function attachFigure(bridge: FigureBridge, figId: string,
   }
 }
 
+/** The hover readout anyplotlib computes on the SHOWN grid: `col`/`row` index the
+ *  array the figure holds, `value` is its value there. */
+export interface ReadoutInfo {
+  panel_id: string
+  img_x: number
+  img_y: number
+  col: number
+  row: number
+  xdata: number
+  ydata: number
+  units: string
+  value: number | null
+  exact: boolean
+  rgba: number[] | null
+  text: string
+}
+
+/** A window `message` listener passing on the readouts ONE frame relays
+ *  (`fill_iframe_html`'s relay); `null` means the cursor left the image. */
+export function readoutListener(
+  frame: () => Window | null | undefined,
+  onReadout: (info: ReadoutInfo | null) => void,
+): (e: MessageEvent) => void {
+  return (e) => {
+    const src = frame()
+    if (e.data?.type !== 'apl_readout' || !src || e.source !== src) return
+    onReadout(e.data.info ?? null)
+  }
+}
+
 
 export function createFigureBridge(
   log: (label: string, detail: Record<string, unknown>) => void = () => {},
