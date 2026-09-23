@@ -115,7 +115,12 @@ tests, and builds the wheel and checks what it carries.
 
 The version is written once, in `de_shell/__init__.py`. To release:
 
-1. Bump `__version__`, move the `CHANGELOG.md` entries under the new version.
+1. Bump `__version__`, then assemble the changelog from the pull requests'
+   news fragments: `uv tool run towncrier build --version X.Y.Z`. That writes the new
+   section into `CHANGELOG.rst` and deletes the fragments it consumed, so stage
+   `upcoming_changes/` with `git add -A` — a plain `git add CHANGELOG.rst`
+   leaves the deletions behind and the next release re-publishes them. Preview
+   with `--draft` first; it consumes nothing.
 2. Commit, tag `vX.Y.Z`, push the tag.
 
 `.github/workflows/publish.yml` builds the distributions, refuses a tag that
@@ -156,6 +161,9 @@ SpyDE commit the app copies were taken from:
 * **The protocol is the contract.** `PLOTAPP:` JSON lines and `PLOTBIN:`
   binary frames over the sidecar's stdio. Both halves of it live in this one
   package on purpose; keep it that way.
+* **Every pull request carries its own changelog entry**, as a news fragment
+  under [`upcoming_changes/`](upcoming_changes/README.rst) — one file per PR,
+  so two of them never conflict over the same lines of `CHANGELOG.rst`.
 * **LF line endings**, enforced by `.gitattributes`.
 
 ## License
