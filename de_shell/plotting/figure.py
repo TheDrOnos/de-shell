@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -634,11 +635,12 @@ class FigureView:
         return rect
 
     def add_texts(self, offsets, texts, *, name: str | None = None,
-                  color: str = "#ffffff", fontsize: int = 12,
+                  color: str | Sequence[str] = "#ffffff", fontsize: int = 12,
                   fontweight: str = "normal", outline_color: str | None = None):
         """Text labels at image-pixel positions (top-left anchors). Returns the
         group, or None. The same `name` again replaces it in place;
-        `remove_widget` drops it. `outline_color` draws a legibility halo.
+        `remove_widget` drops it. `color` is one colour or one per text.
+        `outline_color` draws a legibility halo.
         """
         if not self.is_open:
             return None

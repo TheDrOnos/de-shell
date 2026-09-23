@@ -214,6 +214,12 @@ class TestOverlays:
         v.remove_widget(g)
         assert "labels" not in texts
 
+    def test_texts_accept_one_colour_per_text(self):
+        v = self._open()
+        g = v.add_texts([[4, 5], [6, 7]], ["a", "b"],
+                         color=["#ff0000", "#00ff00"])
+        assert g._data["color"] == ["#ff0000", "#00ff00"]
+
     def test_texts_on_a_closed_figure_are_none(self):
         assert FigureView(0).add_texts([[0, 0]], ["x"]) is None
 
