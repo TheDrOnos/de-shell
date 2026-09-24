@@ -10,9 +10,9 @@
  * Run: `node --test src/pythonEnv.test.ts` (from packages/shell-main/), or via
  * the `test:unit` npm script.
  */
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, mkdirSync } from 'fs'
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { configureShell } from './config.ts'
@@ -24,17 +24,29 @@ configureShell({
   pythonModule: 'testapp',
 })
 
+/** Every temp directory these tests make, removed when the file is done. */
+const tempDirs: string[] = []
+after(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true })
+})
+
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  tempDirs.push(dir)
+  return dir
+}
+
 /** A directory containing a uv stub under both spellings, so these tests do not
  *  fork on the host platform. */
 function dirWithUv(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'uv-stub-'))
+  const dir = tempDir('uv-stub-')
   writeFileSync(join(dir, 'uv'), '')
   writeFileSync(join(dir, 'uv.exe'), '')
   return dir
 }
 
 function emptyDir(): string {
-  return mkdtempSync(join(tmpdir(), 'uv-none-'))
+  return tempDir('uv-none-')
 }
 
 /** An env whose PATH and every fallback root point somewhere we control. */
