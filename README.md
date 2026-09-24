@@ -115,13 +115,20 @@ tests, and builds the wheel and checks what it carries.
 
 The version is written once, in `de_shell/__init__.py`. To release:
 
-1. Bump `__version__`, then assemble the changelog from the pull requests'
-   news fragments: `uv tool run towncrier build --version X.Y.Z`. That writes the new
-   section into `CHANGELOG.rst` and deletes the fragments it consumed, so stage
-   `upcoming_changes/` with `git add -A` — a plain `git add CHANGELOG.rst`
-   leaves the deletions behind and the next release re-publishes them. Preview
-   with `--draft` first; it consumes nothing.
-2. Commit, tag `vX.Y.Z`, push the tag.
+1. Run **Prepare Release** from the Actions tab and pick the bump (`minor`,
+   `bugfix`, `major`, `pre-release`, or `finalize` to drop a `bN` suffix). It
+   bumps `__version__`, assembles `CHANGELOG.rst` from the news fragments in
+   `upcoming_changes/`, runs the pre-flight checks, and opens a release PR that
+   names the one tag that will pass.
+2. Review and merge that PR, then tag the merge commit and push the tag — the
+   PR body has the exact commands.
+
+The tag has to match `__version__` exactly; going through the workflow makes
+them agree by construction, because the PR *is* the bump. To assemble the
+changelog by hand instead, `uv tool run towncrier build --version X.Y.Z` does
+the same thing — but stage `upcoming_changes/` with `git add -A`, because
+towncrier deletes the fragments it consumed and a plain `git add CHANGELOG.rst`
+leaves the deletions behind for the next release to re-publish.
 
 `.github/workflows/publish.yml` builds the distributions, refuses a tag that
 does not match `__version__`, and uploads to PyPI through trusted publishing
