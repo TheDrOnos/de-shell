@@ -1,5 +1,0 @@
-An end-to-end launch through the testing harness left its temporary Electron
-profile directory behind — a few megabytes per launch, and a downstream app's
-full suite added about 150. ``closeApp`` now removes it once the process is
-down, on the clean-close, hard-kill and no-app paths alike, and ``launchApp``
-reports the path as ``profileDir``.
