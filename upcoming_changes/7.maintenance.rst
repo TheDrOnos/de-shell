@@ -1,0 +1,4 @@
+A **Prepare Release** workflow bumps the version, assembles the changelog and
+opens the release pull request, so the tag and ``de_shell.__version__`` agree by
+construction rather than being checked against each other after the tag is
+pushed.

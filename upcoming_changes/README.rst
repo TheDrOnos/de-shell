@@ -80,11 +80,9 @@ Examples
 Building
 --------
 
-There is no Prepare Release workflow here; the changelog is assembled by hand
-as step 1 of `Releasing <../README.md#releasing>`_::
-
-    uv tool run towncrier build --version X.Y.Z
-
-To preview without consuming the fragments::
+The **Prepare Release** workflow runs ``towncrier build`` for you, so the
+release PR carries the assembled changelog — see `Releasing
+<../README.md#releasing>`_. To preview locally without consuming the
+fragments::
 
     uv tool run towncrier build --draft --version X.Y.Z

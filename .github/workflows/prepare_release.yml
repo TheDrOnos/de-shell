@@ -1,0 +1,279 @@
+name: Prepare Release
+
+# Run manually from the Actions tab (same flow and vocabulary as SpyDE's and
+# anyplotlib's Prepare Release). Creates a branch + PR that bumps the version,
+# assembles the changelog from the news fragments, and tells you the one tag
+# that will pass — ready to review before tagging.
+#
+# publish.yml hard-fails when the pushed tag does not match
+# de_shell.__version__. Going through this workflow makes the two agree by
+# construction, because the PR IS the bump the tag has to match.
+#
+# Version FORMAT note: de-shell is a PyPI package, so its version is PEP 440
+# and a pre-release is `bN` (0.3.0b2) — anyplotlib's shape, not SpyDE's semver
+# `-rc.N` (npm cannot store bN). The INPUT NAMES match both repos exactly
+# (finalize / minor / bugfix / major / pre-release, plus the beta checkbox);
+# only the emitted suffix differs.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version component to bump"
+        required: true
+        type: choice
+        options:
+          - finalize      # drop the bN suffix: release the current beta's base as stable (0.3.0b2 -> 0.3.0)
+          - minor
+          - bugfix
+          - major
+          - pre-release   # increments the bN counter on the current base version
+      beta:
+        description: "Mark as beta pre-release (adds bN suffix). Ignored for 'pre-release' (always beta) and 'finalize' (always stable)."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # push the release branch
+  pull-requests: write   # open the PR
+
+jobs:
+  prepare:
+    name: Prepare release PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      # ── Compute the new version ──────────────────────────────────────────
+      # de_shell/__init__.py is the ONE place the version is written:
+      # pyproject.toml reads it as a dynamic version, and publish.yml refuses a
+      # tag that disagrees with it.
+      - name: Compute new version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          IS_BETA: ${{ inputs.beta }}
+        run: |
+          CURRENT=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' de_shell/__init__.py)
+          if [ -z "$CURRENT" ]; then
+            echo "::error::could not read __version__ from de_shell/__init__.py"
+            exit 1
+          fi
+          export CURRENT_VERSION="$CURRENT"
+
+          NEW_VERSION=$(uv run --no-project python - <<'PYEOF'
+          import os, re, sys
+
+          current = os.environ["CURRENT_VERSION"]
+          bump    = os.environ["BUMP"]
+          is_beta = os.environ["IS_BETA"].lower() == "true"
+
+          # PEP 440 pre-release: bN — what PyPI and pip sort correctly.
+          m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:b(\d+))?$", current)
+          if not m:
+              sys.exit(f"unparseable current version: {current!r}")
+          major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+          beta_n  = int(m.group(4)) if m.group(4) else None
+          on_beta = beta_n is not None
+
+          if bump == "finalize":
+              # Release the current beta's base as stable: just drop the bN
+              # suffix, keep major.minor.patch. e.g. 0.3.0b2 -> 0.3.0.
+              if not on_beta:
+                  sys.exit(
+                      f"'finalize' requires a beta base version, but current "
+                      f"version {current!r} has no bN suffix. Use minor / bugfix "
+                      f"/ major to start a new release instead."
+                  )
+              is_beta = False
+          elif bump == "pre-release":
+              # Keep the same base; just walk the beta counter forward.
+              is_beta = True
+              beta_n  = (beta_n or 0) + 1
+          elif on_beta:
+              # We are on a beta of the NEXT release (e.g. 0.3.0b2). The base
+              # major.minor.patch is that upcoming version, so minor/bugfix/major
+              # must bump relative to the LAST STABLE (base - the in-progress
+              # component), not skip a whole version. The common intent from a
+              # beta is 'finalize', so steer the user there rather than guess.
+              nxt = ("%d.%d.0" % (major, minor + 1)) if bump == "minor" else "..."
+              sys.exit(
+                  f"Current version {current!r} is a beta of the upcoming "
+                  f"{major}.{minor}.{patch} release. To ship it, use "
+                  f"bump='finalize' (-> {major}.{minor}.{patch}). A '{bump}' bump "
+                  f"from a beta would skip {major}.{minor}.{patch} entirely "
+                  f"(e.g. -> {nxt}); that is almost never intended."
+              )
+          elif bump == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif bump == "minor":
+              minor, patch = minor + 1, 0
+          elif bump == "bugfix":
+              patch += 1
+
+          if is_beta:
+              if bump != "pre-release":
+                  beta_n = 1          # fresh beta series for the new base
+              print(f"{major}.{minor}.{patch}b{beta_n}", end="")
+          else:
+              print(f"{major}.{minor}.{patch}", end="")
+          PYEOF
+          )
+
+          # Derive is_beta from the COMPUTED version (ends in bN?), not the raw
+          # input — so 'finalize' is always treated as stable and a mismatched
+          # beta checkbox cannot mislabel the release.
+          if [[ "$NEW_VERSION" =~ b[0-9]+$ ]]; then IS_BETA_OUT=true; else IS_BETA_OUT=false; fi
+
+          echo "new_version=$NEW_VERSION"     >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_VERSION"            >> "$GITHUB_OUTPUT"
+          echo "branch=release/v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_beta=$IS_BETA_OUT"         >> "$GITHUB_OUTPUT"
+          echo "Bumping (${BUMP}): $CURRENT → $NEW_VERSION"
+
+      - name: Fail if the tag already exists
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.version.outputs.tag }}" | grep -q .; then
+            echo "::error::tag ${{ steps.version.outputs.tag }} already exists on origin"
+            exit 1
+          fi
+
+      # ── Release pre-flight checks — fail HERE, not at release time ───────
+      # A drifted lock is the APPS' problem, not ours: they resolve the sidecar
+      # env from a lock on the user's machine, so it surfaces at their user's
+      # first launch rather than in any build of ours.
+      - name: Verify uv.lock is in sync with pyproject.toml
+        run: uv lock --check
+
+      # Git deps must reference explicit SHAs or tags, never moving branches —
+      # otherwise the same release resolves different code over time. There are
+      # none today; this keeps it that way.
+      - name: Verify git dependencies are pinned to SHAs or tags
+        run: |
+          bad=$(grep -nE "git\+https" pyproject.toml | grep -vE '@[0-9a-f]{40}"|@v?[0-9]+(\.[0-9]+)+[^"]*"' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::unpinned git dependencies in pyproject.toml:"
+            echo "$bad"
+            exit 1
+          fi
+
+      # ── Bump the version ─────────────────────────────────────────────────
+      # sed is silent when its pattern misses, and a silent no-op here would
+      # produce a release PR that bumps nothing and a tag publish.yml rejects —
+      # so read the value back and fail if it did not land.
+      - name: Bump de_shell/__init__.py
+        env:
+          V: ${{ steps.version.outputs.new_version }}
+        run: |
+          sed -i "s/^__version__ = \".*\"/__version__ = \"${V}\"/" de_shell/__init__.py
+          WROTE=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' de_shell/__init__.py)
+          if [ "$WROTE" != "$V" ]; then
+            echo "::error::the bump did not land — __version__ is '$WROTE', expected '$V'"
+            exit 1
+          fi
+          echo "de_shell.__version__ = $WROTE"
+
+      # Assemble CHANGELOG.rst from the per-PR fragments in upcoming_changes/
+      # and delete them. --yes skips the interactive confirm. The version is
+      # passed explicitly even though `package = "de_shell"` would let towncrier
+      # read it: that import wants the package's dependencies installed, and
+      # this job has no other reason to install them.
+      #
+      # Not fatal when there are no fragments: a release can legitimately carry
+      # none (a re-cut, or a beta bump with nothing new), and failing the whole
+      # prepare run over a missing news file would be worse than release notes
+      # that say nothing.
+      - name: Assemble the changelog
+        env:
+          V: ${{ steps.version.outputs.new_version }}
+        run: |
+          COUNT=$(find upcoming_changes -maxdepth 1 -name '*.rst' ! -name 'README.rst' | wc -l)
+          if [ "$COUNT" -gt 0 ]; then
+            # --draft first, into a temp file, so the PR body can quote the notes
+            # after `build` has consumed the fragments they came from.
+            uv tool run towncrier build --draft --version "$V" > "${RUNNER_TEMP}/release-notes.rst"
+            uv tool run towncrier build --yes   --version "$V"
+          else
+            echo "no changelog fragments — skipping towncrier"
+          fi
+
+      # ── Commit and push ──────────────────────────────────────────────────
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit release changes
+        run: |
+          git checkout -b "${{ steps.version.outputs.branch }}"
+          git add de_shell/__init__.py
+          # -A, because towncrier DELETES the fragments it consumed: a plain
+          # `git add CHANGELOG.rst` stages the assembled notes but leaves the
+          # deletions unstaged, and the next release re-publishes them.
+          git add -A CHANGELOG.rst upcoming_changes
+          git commit -m "chore: prepare release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.branch }}"
+
+      # ── Open pull request ────────────────────────────────────────────────
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          gh pr create \
+            --title "Release ${TAG}" \
+            --base  main \
+            --head  "${BRANCH}" \
+            --body  "## Release ${TAG}
+
+          > Auto-generated by the **Prepare Release** workflow.
+
+          ### What changed
+          - \`de_shell/__init__.py\` bumped to \`${TAG#v}\` — the one place the version is
+            written, and the value \`publish.yml\` refuses to let a tag disagree with
+          - Pre-flight checks passed: \`uv lock --check\`, git deps pinned to SHAs/tags
+          - \`CHANGELOG.rst\` assembled from the fragments in \`upcoming_changes/\`
+
+          <details><summary><b>Release notes</b> (as they will appear in \`CHANGELOG.rst\`)</summary>
+
+          \`\`\`rst
+          $(cat "${RUNNER_TEMP}/release-notes.rst" 2>/dev/null || echo 'No changelog fragments were filed for this release.')
+          \`\`\`
+          </details>
+
+          ### Review checklist
+          - [ ] \`CHANGELOG.rst\` reads well — edit the assembled text directly if needed
+          - [ ] Version is correct in \`de_shell/__init__.py\`
+          - [ ] CI passes. The wheel-contents leg is the one that matters most: it fails
+            if \`de_shell/js\` is missing, which is the whole point of the package.
+
+          ### Manual check CI cannot cover
+          CI never runs Electron — it typechecks the TypeScript and runs the node unit
+          tests, nothing more. Before tagging a release that touched the sidecar
+          protocol or \`de_shell/js\`:
+          - [ ] Link this tree into one app (\`python -m de_shell.js\` prints the path)
+            and run that app's e2e suite against it.
+
+          ### After merging
+          Tag **the merge commit on main** — the tag MUST be exactly \`${TAG}\`:
+          \`\`\`bash
+          git fetch origin
+          git tag ${TAG} origin/main
+          git push origin ${TAG}
+          \`\`\`
+          The tag push triggers \`publish.yml\`: it refuses a tag that does not match
+          \`de_shell.__version__\`, builds the distributions, checks the wheel carries
+          \`de_shell/js\`, and uploads to PyPI through trusted publishing.
+          - [ ] **Confirm it actually published** before telling the apps to pin it:
+            \`uv pip index versions de-shell\` should list \`${TAG#v}\`."
