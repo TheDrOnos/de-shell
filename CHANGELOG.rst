@@ -12,6 +12,32 @@ change to the sidecar protocol bumps the minor.
 
 .. towncrier release notes start
 
+0.3.0 (2026-09-24)
+==================
+
+Bug Fixes
+---------
+
+- An end-to-end launch through the testing harness left its temporary Electron
+  profile directory behind — a few megabytes per launch, and a downstream app's
+  full suite added about 150. ``closeApp`` now removes it once the process is
+  down, on the clean-close, hard-kill and no-app paths alike, and ``launchApp``
+  reports the path as ``profileDir``. (`#2 <https://github.com/directelectron/de-shell/pull/2>`_)
+
+
+Maintenance
+-----------
+
+- A **Prepare Release** workflow bumps the version, assembles the changelog and
+  opens the release pull request, so the tag and ``de_shell.__version__`` agree by
+  construction rather than being checked against each other after the tag is
+  pushed. (`#7 <https://github.com/directelectron/de-shell/pull/7>`_)
+- The changelog is now assembled by `towncrier
+  <https://towncrier.readthedocs.io/>`_ from one news fragment per pull request
+  under ``upcoming_changes/``, as SpyDE and anyplotlib already do, and lives in
+  ``CHANGELOG.rst`` rather than ``CHANGELOG.md``.
+
+
 0.2.2 (2026-09-22)
 ==================
 
