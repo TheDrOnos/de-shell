@@ -386,3 +386,168 @@ test('close() with no connections resolves, and calling it again resolves too', 
   await relay.close()
   assert.equal(spy.servers[0].listening, false)
 })
+
+/** A manual clock for the relay's timers: nothing fires until advance(). */
+function fakeClock() {
+  let now = 0
+  let nextId = 1
+  const timers = new Map<number, { at: number; fn: () => void }>()
+  return {
+    setTimeout: (fn: () => void, ms: number): unknown => {
+      const id = nextId++
+      timers.set(id, { at: now + ms, fn })
+      return id
+    },
+    clearTimeout: (handle: unknown): void => {
+      timers.delete(handle as number)
+    },
+    advance(ms: number): void {
+      now += ms
+      const due = [...timers].filter(([, t]) => t.at <= now).sort((x, y) => x[1].at - y[1].at)
+      for (const [id, t] of due) {
+        if (timers.delete(id)) t.fn()
+      }
+    },
+    get pending(): number {
+      return timers.size
+    },
+  }
+}
+
+function clocked(clock: ReturnType<typeof fakeClock>, extra: Partial<RelayOptions> = {}): Partial<RelayOptions> {
+  return { setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, ...extra }
+}
+
+const admitOnHello: Hooks = {
+  onLine: (c, line) => {
+    if (line === 'hello') c.admit()
+  },
+}
+
+test('a silent client is closed as hello-timeout when the injected clock reaches helloTimeoutMs', async () => {
+  const clock = fakeClock()
+  const h = await startRelay(clocked(clock, { helloTimeoutMs: 10_000 }))
+  try {
+    const c = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    clock.advance(9_999)
+    assert.deepEqual(reasonsOf(h.events), [])
+    clock.advance(1)
+    assert.deepEqual(reasonsOf(h.events), ['hello-timeout'])
+    await socketClosed(c)
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('the hello timer runs from accept to admit(): a line the app does not admit does not stop it', async () => {
+  const clock = fakeClock()
+  const h = await startRelay(clocked(clock, { helloTimeoutMs: 10_000 }))
+  try {
+    const c = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    c.write('hello\n')
+    await waitFor(() => linesOf(h.events).length === 1, 'hello')
+    clock.advance(10_000)
+    assert.deepEqual(reasonsOf(h.events), ['hello-timeout'])
+    await socketClosed(c)
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('admit() stops the hello timer', async () => {
+  const clock = fakeClock()
+  const h = await startRelay(clocked(clock), admitOnHello)
+  try {
+    const c = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    c.write('hello\n')
+    await waitFor(() => linesOf(h.events).length === 1, 'hello')
+    assert.equal(clock.pending, 0, 'admit() cancelled the timer')
+    clock.advance(1_000_000)
+    c.write('still here\n')
+    await waitFor(() => linesOf(h.events).length === 2, 'the second line')
+    assert.deepEqual(reasonsOf(h.events), [])
+    c.destroy()
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('a pre-admit line over the cap closes as line-too-long; the same line after admit() passes', async () => {
+  const clock = fakeClock()
+  const long = 'x'.repeat(17)
+  const h = await startRelay(clocked(clock, { preAdmitLineBytes: 16 }), admitOnHello)
+  try {
+    const a = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1, 'first')
+    a.write(`${long}\n`)
+    await waitFor(() => reasonsOf(h.events, 0).length === 1, 'first onClose')
+    assert.deepEqual(reasonsOf(h.events, 0), ['line-too-long'])
+    assert.deepEqual(linesOf(h.events, 0), [])
+    const b = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 2, 'second')
+    // One write: admit() inside onLine('hello') lifts the cap for the rest of the same chunk.
+    b.write(`hello\n${long}\n`)
+    await waitFor(() => linesOf(h.events, 1).length === 2, 'both lines')
+    assert.deepEqual(linesOf(h.events, 1), ['hello', long])
+    assert.deepEqual(reasonsOf(h.events, 1), [])
+    b.destroy()
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('a line of exactly the cap passes; a pre-admit partial line past it closes as line-too-long', async () => {
+  const clock = fakeClock()
+  const h = await startRelay(clocked(clock, { preAdmitLineBytes: 16 }))
+  try {
+    const c = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    c.write(`${'y'.repeat(16)}\n`)
+    await waitFor(() => linesOf(h.events).length === 1, 'the 16-byte line')
+    c.write('z'.repeat(10))
+    await sleep(50)
+    assert.deepEqual(reasonsOf(h.events), [], 'ten bytes are under the cap')
+    c.write('z'.repeat(7))   // no newline ever: the partial line alone crosses the cap
+    await waitFor(() => reasonsOf(h.events).length === 1, 'onClose')
+    assert.deepEqual(reasonsOf(h.events), ['line-too-long'])
+    assert.deepEqual(linesOf(h.events), ['y'.repeat(16)])
+    await socketClosed(c)
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('after admit() the cap is lineBytes', async () => {
+  const clock = fakeClock()
+  const h = await startRelay(clocked(clock, { preAdmitLineBytes: 16, lineBytes: 32 }), admitOnHello)
+  try {
+    const c = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    c.write(`hello\n${'y'.repeat(32)}\n${'y'.repeat(33)}\n`)
+    await waitFor(() => reasonsOf(h.events).length === 1, 'onClose')
+    assert.deepEqual(linesOf(h.events), ['hello', 'y'.repeat(32)])
+    assert.deepEqual(reasonsOf(h.events), ['line-too-long'])
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('a connection that closes cancels its hello timer', async () => {
+  const clock = fakeClock()
+  const h = await startRelay(clocked(clock))
+  try {
+    const c = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    assert.equal(clock.pending, 1)
+    c.end()
+    await waitFor(() => reasonsOf(h.events).length === 1, 'onClose')
+    assert.equal(clock.pending, 0)
+    clock.advance(1_000_000)
+    assert.deepEqual(reasonsOf(h.events), ['peer'])
+  } finally {
+    await h.relay.close()
+  }
+})
