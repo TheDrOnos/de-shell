@@ -377,6 +377,8 @@ def relay():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 def test_round_trip_against_a_real_relay(relay):
