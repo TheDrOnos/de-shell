@@ -11,6 +11,7 @@ const payload = Buffer.alloc(256 * 1024)
 for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff
 payload.write('\nPLOTBIN:9:9\n', 1000, 'latin1')
 
+setTimeout(() => process.exit(3), 60_000).unref()
 const greeted = new WeakSet()
 const relay = await createRelay({
   host: '127.0.0.1',
@@ -33,4 +34,3 @@ process.stdin.resume()
 process.stdin.on('end', () => {
   relay.close().then(() => process.exit(0))
 })
-setTimeout(() => process.exit(3), 60_000).unref()
