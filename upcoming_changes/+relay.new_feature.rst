@@ -1,0 +1,1 @@
+Apps gained a way to serve their backend's protocol to a remote client: ``createRelay`` (exported from ``@de/shell-main`` with the ``encodeMessage`` and ``encodeBinary`` encoders) listens on a TCP port and speaks the PLOTAPP/PLOTBIN framing, and ``de_shell.remote_client`` is its synchronous, standard-library Python client.
