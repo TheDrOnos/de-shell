@@ -123,7 +123,7 @@ function spyServer() {
       accepted.push({ socket, log })
     })
     return server
-  }) as typeof net.createServer
+  })
   return { createServer, servers, accepted }
 }
 
@@ -159,6 +159,26 @@ test('a bind to an address this machine lacks rejects with the OS error and leav
   )
   assert.equal(spy.servers.length, 1, 'the injected factory made the server')
   assert.equal(spy.servers[0].listening, false)
+})
+
+test('an empty host rejects with a TypeError before any server is made', async () => {
+  const spy = spyServer()
+  await assert.rejects(
+    createRelay({
+      host: '',
+      port: 0,
+      onConnection: () => {},
+      onLine: () => {},
+      onClose: () => {},
+      createServer: spy.createServer,
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof TypeError, String(err))
+      assert.match(err.message, /host is required/)
+      return true
+    },
+  )
+  assert.equal(spy.servers.length, 0, 'no server was made')
 })
 
 test('a port already in use rejects with EADDRINUSE', async () => {

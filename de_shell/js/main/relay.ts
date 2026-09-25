@@ -50,7 +50,7 @@ export interface Relay {
 }
 
 export interface RelayOptions {
-  /** Bound exactly: no fallback, no discovery. '0.0.0.0' binds every interface only when the app passes it. */
+  /** Bound exactly: no fallback, no discovery. '0.0.0.0' binds every interface only when the app passes it; an empty host is refused. */
   host: string
   /** 0 = ephemeral; the bound port is reported on the Relay. */
   port: number
@@ -59,7 +59,7 @@ export interface RelayOptions {
   onLine: (c: RelayConnection, line: string) => void
   /** Exactly once per connection; `err` is set for 'error'. */
   onClose: (c: RelayConnection, reason: RelayCloseReason, err?: Error) => void
-  /** Accept to admit(); past it the connection is closed as 'hello-timeout'. Default 10 000. */
+  /** Accept to admit(); past it the connection is closed as 'hello-timeout'. Must be > 0 (0 is not "disabled": it fires on the next tick). Default 10 000. */
   helloTimeoutMs?: number
   /** Line cap in bytes (those before the '\n') until admit(). Default 64 KiB. */
   preAdmitLineBytes?: number
@@ -72,7 +72,7 @@ export interface RelayOptions {
    * factory returning tls.createServer(tlsOptions, connectionListener) fits.
    * Default net.createServer.
    */
-  createServer?: typeof net.createServer
+  createServer?: (listener: (socket: net.Socket) => void) => net.Server
   /** The clock for the relay's timers; tests inject a fake one. Default: the global setTimeout. */
   setTimeout?: (fn: () => void, ms: number) => unknown
   /** Pairs with setTimeout. Default: the global clearTimeout. */
@@ -89,6 +89,7 @@ function asError(e: unknown): Error {
 }
 
 export function createRelay(opts: RelayOptions): Promise<Relay> {
+  if (!opts.host) return Promise.reject(new TypeError('createRelay: host is required; pass "0.0.0.0" to bind every interface'))
   const helloTimeoutMs = opts.helloTimeoutMs ?? 10_000
   const preAdmitLineBytes = opts.preAdmitLineBytes ?? 64 * 1024
   const lineBytes = opts.lineBytes ?? 16 * 1024 * 1024
