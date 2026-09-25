@@ -9,11 +9,13 @@ trace both ways.
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from anyplotlib._binary_frame import encode_frame
@@ -325,3 +327,80 @@ def test_a_short_recv_poll_on_one_thread_does_not_break_a_long_send_on_another(p
     lines = bytes(received).splitlines()
     assert [json.loads(line)["i"] for line in lines] == list(range(count))
     assert all(json.loads(line)["data"] == block for line in lines)
+
+
+# --- cross-runtime: a real createRelay under Node -----------------------------
+
+REPO = Path(__file__).resolve().parents[1]
+HELPER = Path(__file__).with_name("relay_echo_server.mjs")
+
+# The frame the helper sends after the first line: every byte value, plus
+# newline and marker lookalikes inside the payload.
+_probe = bytearray(i & 0xFF for i in range(256 * 1024))
+_probe[1000:1013] = b"\nPLOTBIN:9:9\n"
+PROBE = bytes(_probe)
+
+
+def _node_that_strips_types() -> str:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not on PATH")
+    probe = subprocess.run(
+        [node, "-p", "Boolean(process.features.typescript)"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if probe.stdout.strip() != "true":
+        pytest.skip("node on PATH cannot strip TypeScript types (needs Node >= 22.18)")
+    return node
+
+
+@pytest.fixture
+def relay():
+    """The helper running a real createRelay; yields (port, process)."""
+    node = _node_that_strips_types()
+    proc = subprocess.Popen(
+        [node, str(HELPER)], cwd=REPO,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        first = proc.stdout.readline().decode("ascii", "replace").strip()
+        if not first.startswith("PORT "):
+            proc.kill()
+            _, err = proc.communicate(timeout=10)
+            pytest.fail(f"relay helper did not start: {first!r}\n{err.decode('utf-8', 'replace')}")
+        yield int(first.split()[1]), proc
+    finally:
+        if proc.poll() is None:
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def test_round_trip_against_a_real_relay(relay):
+    port, proc = relay
+    conn = remote_client.connect("127.0.0.1", port, timeout=10.0)
+    try:
+        assert conn.remote == ("127.0.0.1", port)
+        conn.send({"type": "hello", "client": "pytest"})
+        assert conn.recv(timeout=10) == (
+            "message", {"type": "echo", "line": '{"type":"hello","client":"pytest"}'},
+        )
+        kind, header, payload = conn.recv(timeout=10)
+        assert kind == "binary"
+        assert header == {"fig_id": "probe", "key": "image", "label": "εxx Å"}
+        assert payload == PROBE
+        action = {"type": "action", "name": "snap", "note": "εxx Å"}
+        conn.send(action)
+        kind, msg = conn.recv(timeout=10)
+        assert (kind, msg["type"], json.loads(msg["line"])) == ("message", "echo", action)
+        conn.send({"type": "bye"})
+        assert conn.recv(timeout=10) == ("message", {"type": "echo", "line": '{"type":"bye"}'})
+        with pytest.raises(ConnectionError):
+            conn.recv(timeout=10)  # the app closed the connection after the echo
+    finally:
+        conn.close()
+    proc.stdin.close()
+    assert proc.wait(timeout=10) == 0
