@@ -8,7 +8,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import * as net from 'node:net'
-import { createRelay } from './relay.ts'
+import { CLOSE_GRACE_MS, createRelay } from './relay.ts'
+import { createStdoutDemux } from './stdoutDemux.ts'
 import type { Relay, RelayCloseReason, RelayConnection, RelayOptions } from './relay.ts'
 
 type Ev =
@@ -550,4 +551,245 @@ test('a connection that closes cancels its hello timer', async () => {
   } finally {
     await h.relay.close()
   }
+})
+
+type Unit =
+  | { kind: 'message'; msg: Record<string, unknown> }
+  | { kind: 'binary'; header: Record<string, unknown>; payload: Buffer }
+  | { kind: 'stream'; text: string }
+
+/** Decode everything the relay sends to `c` with the backend's own demuxer. */
+function collect(c: net.Socket): Unit[] {
+  const units: Unit[] = []
+  const demux = createStdoutDemux({
+    onMessage: (msg) => units.push({ kind: 'message', msg }),
+    onStream: (text) => units.push({ kind: 'stream', text }),
+    onBinary: (header, payload) => units.push({ kind: 'binary', header, payload }),
+  })
+  c.on('data', (chunk: Buffer) => demux.push(chunk))
+  return units
+}
+
+/** Write 1 MiB frames until the socket queues bytes it cannot hand to the kernel (the peer is not reading). */
+function fillUntilQueued(conn: RelayConnection): void {
+  const block = Buffer.alloc(1 << 20)
+  for (let i = 0; i < 256 && conn.writableLength === 0; i++) {
+    conn.writeBinary({ fig_id: 'fill', key: 'k', i }, block)
+  }
+  assert.ok(conn.writableLength > 0, 'the socket never queued; is the peer reading?')
+}
+
+test('writeMessage and writeBinary arrive in order and decode with the demuxer', async () => {
+  const nasty = Buffer.concat([Buffer.from('\nPLOTBIN:9:9\nPLOTAPP:{}\n', 'ascii'), Buffer.alloc(4096, 7)])
+  const h = await startRelay({}, {
+    onConnection: (conn) => {
+      conn.writeMessage({ type: 'welcome', v: 1 })
+      conn.writeBinary({ fig_id: 'f1', key: 'image', label: 'εxx' }, nasty)
+      conn.writeMessage({ type: 'done' })
+    },
+  })
+  try {
+    const c = await connectClient(h.relay.port)
+    const units = collect(c)
+    await waitFor(() => units.length === 3, 'three units')
+    assert.deepEqual(units, [
+      { kind: 'message', msg: { type: 'welcome', v: 1 } },
+      { kind: 'binary', header: { fig_id: 'f1', key: 'image', label: 'εxx' }, payload: nasty },
+      { kind: 'message', msg: { type: 'done' } },
+    ])
+    c.destroy()
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('writeBinary corks the socket around its three writes', async () => {
+  const spy = spyServer()
+  const h = await startRelay({ createServer: spy.createServer })
+  try {
+    const c = await connectClient(h.relay.port)
+    await waitFor(() => h.conns.length === 1 && spy.accepted.length === 1, 'the connection')
+    const log = spy.accepted[0].log
+    const from = log.length
+    const header = { fig_id: 'f', key: 'k' }
+    h.conns[0].writeBinary(header, Buffer.alloc(1000, 1))
+    const hlen = Buffer.byteLength(JSON.stringify(header))
+    assert.deepEqual(log.slice(from), [
+      'cork',
+      `write:${`PLOTBIN:${hlen}:1000\n`.length}`,
+      `write:${hlen}`,
+      'write:1000',
+      'uncork',
+    ])
+    c.destroy()
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('writeMessage refuses a non-finite number and writes nothing; the connection stays usable', async () => {
+  const h = await startRelay()
+  try {
+    const c = await connectClient(h.relay.port)
+    const units = collect(c)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    const conn = h.conns[0]
+    assert.throws(() => conn.writeMessage({ type: 'fit', value: NaN }), RangeError)
+    assert.throws(
+      () => conn.writeBinary({ fig_id: 'f', key: 'k', clim: [0, Infinity] }, Buffer.alloc(8)),
+      RangeError,
+    )
+    conn.writeMessage({ type: 'after' })
+    await waitFor(() => units.length === 1, 'one unit')
+    await sleep(20)
+    assert.deepEqual(units, [{ kind: 'message', msg: { type: 'after' } }])
+    assert.deepEqual(reasonsOf(h.events), [])
+    c.destroy()
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('everything written before close() arrives before EOF, the refusal last; onClose reports app once', async () => {
+  // 8 MiB ahead of the refusal, so bytes are still queued in the relay when
+  // close() runs: a close that destroyed the socket would lose them (a lone
+  // small write reaches the kernel at once and would not tell the two apart).
+  const block = Buffer.alloc(1 << 20, 3)
+  let queuedAtClose = -1
+  const h = await startRelay({}, {
+    onLine: (conn, line) => {
+      if (line === 'hello') {
+        for (let i = 0; i < 8; i++) conn.writeBinary({ fig_id: 'f', key: 'k', i }, block)
+        conn.writeMessage({ type: 'refused', reason: 'not paired' })
+        queuedAtClose = conn.writableLength
+        conn.close()
+      }
+    },
+  })
+  try {
+    const c = await connectClient(h.relay.port)
+    const units = collect(c)
+    c.write('hello\n')
+    await socketClosed(c)
+    assert.ok(queuedAtClose > 0, 'bytes were still queued in the relay when close() was called')
+    assert.equal(units.length, 9)
+    assert.deepEqual(
+      units.slice(0, 8).map((u) => (u.kind === 'binary' ? [u.header.i, u.payload.length] : null)),
+      [0, 1, 2, 3, 4, 5, 6, 7].map((i) => [i, 1 << 20]),
+    )
+    assert.deepEqual(units[8], { kind: 'message', msg: { type: 'refused', reason: 'not paired' } })
+    await sleep(50)
+    assert.deepEqual(reasonsOf(h.events), ['app'])
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('close() to a client that never reads destroys the socket after CLOSE_GRACE_MS', async () => {
+  const clock = fakeClock()
+  const spy = spyServer()
+  const h = await startRelay(clocked(clock, { createServer: spy.createServer }))
+  const c = await connectClient(h.relay.port)
+  c.pause()
+  try {
+    await waitFor(() => h.conns.length === 1 && spy.accepted.length === 1, 'the connection')
+    const conn = h.conns[0]
+    conn.admit()
+    fillUntilQueued(conn)
+    conn.close()
+    assert.deepEqual(reasonsOf(h.events), ['app'])
+    const socket = spy.accepted[0].socket
+    clock.advance(CLOSE_GRACE_MS - 1)
+    assert.equal(socket.destroyed, false, 'still flushing inside the grace period')
+    clock.advance(1)
+    assert.equal(socket.destroyed, true)
+    assert.deepEqual(reasonsOf(h.events), ['app'], 'onClose fired once')
+  } finally {
+    await h.relay.close()
+    c.destroy()
+  }
+})
+
+test('writes after close() are dropped without throwing', async () => {
+  const h = await startRelay()
+  try {
+    const c = await connectClient(h.relay.port)
+    const units = collect(c)
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    const conn = h.conns[0]
+    conn.close()
+    conn.writeMessage({ type: 'late' })
+    conn.writeBinary({ fig_id: 'f', key: 'k' }, Buffer.alloc(4))
+    conn.close()
+    conn.admit()
+    await socketClosed(c)
+    assert.deepEqual(units, [])
+    assert.deepEqual(reasonsOf(h.events), ['app'])
+  } finally {
+    await h.relay.close()
+  }
+})
+
+test('writableLength grows when the peer stops reading', async () => {
+  const h = await startRelay()
+  const c = await connectClient(h.relay.port)
+  c.pause()
+  try {
+    await waitFor(() => h.conns.length === 1, 'the connection')
+    assert.equal(h.conns[0].writableLength, 0)
+    fillUntilQueued(h.conns[0])
+  } finally {
+    await h.relay.close()
+    c.destroy()
+  }
+})
+
+test('keepalive and no-delay are set on each accepted socket; keepAliveMs 0 leaves keepalive off', async () => {
+  const cases: Array<[number | undefined, string | null]> = [
+    [undefined, 'setKeepAlive:true,15000'],
+    [2500, 'setKeepAlive:true,2500'],
+    [0, null],
+  ]
+  for (const [keepAliveMs, expected] of cases) {
+    const spy = spyServer()
+    const extra: Partial<RelayOptions> = { createServer: spy.createServer }
+    if (keepAliveMs !== undefined) extra.keepAliveMs = keepAliveMs
+    const h = await startRelay(extra)
+    try {
+      const c = await connectClient(h.relay.port)
+      await waitFor(() => spy.accepted.length === 1, 'the connection')
+      const log = spy.accepted[0].log
+      assert.ok(log.includes('setNoDelay:true'), log.join(' '))
+      assert.deepEqual(
+        log.filter((l) => l.startsWith('setKeepAlive')),
+        expected === null ? [] : [expected],
+        `keepAliveMs ${String(keepAliveMs)}`,
+      )
+      c.destroy()
+    } finally {
+      await h.relay.close()
+    }
+  }
+})
+
+test('relay.close() while a connection is still flushing its close: both resolve, onClose once each', async () => {
+  const clock = fakeClock()
+  const spy = spyServer()
+  const h = await startRelay(clocked(clock, { createServer: spy.createServer }))
+  const a = await connectClient(h.relay.port)
+  a.pause()
+  await waitFor(() => h.conns.length === 1, 'first')
+  const b = await connectClient(h.relay.port)
+  await waitFor(() => h.conns.length === 2, 'second')
+  h.conns[0].admit()
+  fillUntilQueued(h.conns[0])
+  h.conns[0].close()                                  // flushing to a peer that will not read
+  await Promise.all([h.relay.close(), h.relay.close()])
+  assert.deepEqual(reasonsOf(h.events, 0), ['app'])
+  assert.deepEqual(reasonsOf(h.events, 1), ['app'])
+  assert.equal(spy.accepted[0].socket.destroyed, true)
+  assert.equal(spy.servers[0].listening, false)
+  await waitFor(() => clock.pending === 0, 'the grace and hello timers cancelled')
+  a.destroy()
+  b.destroy()
 })
