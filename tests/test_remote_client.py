@@ -12,11 +12,13 @@ import json
 import socket
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 from anyplotlib._binary_frame import encode_frame
 
-from de_shell import ipc
+from de_shell import ipc, remote_client
 from de_shell.remote_client import _Decoder
 
 NASTY = b"\nPLOTBIN:9:9\nPLOTAPP:{}\n" + bytes(i & 0xFF for i in range(3000))
@@ -129,6 +131,15 @@ def test_a_malformed_header_raises_after_consuming_the_frame():
     assert decoder.pop() == ("message", {"type": "after"})
 
 
+def test_an_overlong_prefix_number_raises_with_the_line_and_the_decoder_recovers():
+    decoder = _Decoder()
+    decoder.feed(b"PLOTBIN:" + b"9" * 5000 + b":1\nPLOTAPP:{}\n")
+    with pytest.raises(ValueError, match="PLOTBIN prefix") as excinfo:
+        decoder.pop()
+    assert excinfo.value.line == b"PLOTBIN:" + b"9" * 5000 + b":1"
+    assert decoder.pop() == ("message", {})
+
+
 def test_crlf_is_stripped_and_bytes_that_are_not_utf8_become_replacement_characters():
     decoder = _Decoder()
     decoder.feed(b"log line\r\n" + b"f\xff\xfe\n")
@@ -147,3 +158,170 @@ def test_the_client_imports_only_the_standard_library():
     proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout.strip().splitlines()[-1]) == []
+
+
+# --- Connection, on a loopback TCP pair ---------------------------------------
+
+
+@pytest.fixture
+def pair():
+    """A client Connection and the raw server-side socket it is connected to."""
+    server = socket.create_server(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+    conn = remote_client.connect("127.0.0.1", port, timeout=5.0)
+    peer, _ = server.accept()
+    server.close()
+    peer.settimeout(5.0)
+    try:
+        yield conn, peer, port
+    finally:
+        conn.close()
+        peer.close()
+
+
+def _read_line(sock: socket.socket) -> bytes:
+    data = bytearray()
+    while not data.endswith(b"\n"):
+        chunk = sock.recv(65536)
+        assert chunk, "the client closed before a full line"
+        data += chunk
+    return bytes(data)
+
+
+def test_connect_reports_the_remote(pair):
+    conn, _, port = pair
+    assert conn.remote == ("127.0.0.1", port)
+
+
+def test_send_writes_one_compact_json_line(pair):
+    conn, peer, _ = pair
+    obj = {"type": "hello", "note": "εxx Å", "text": "a\nb"}
+    conn.send(obj)
+    line = _read_line(peer)
+    assert line == (json.dumps(obj, separators=(",", ":")) + "\n").encode("ascii")
+    assert line.count(b"\n") == 1
+    assert json.loads(line) == obj
+
+
+def test_send_refuses_a_non_finite_number_and_writes_nothing(pair):
+    conn, peer, _ = pair
+    with pytest.raises(ValueError):
+        conn.send({"type": "fit", "value": float("nan")})
+    conn.send({"ok": True})
+    assert _read_line(peer) == b'{"ok":true}\n'
+
+
+def test_recv_returns_each_unit_kind(pair):
+    conn, peer, _ = pair
+    peer.sendall(
+        b'PLOTAPP:{"type":"a"}\n'
+        + encode_frame("f", "k", {}, b"\x00\n\x01")
+        + b"log line\r\n"
+    )
+    assert conn.recv(timeout=5) == ("message", {"type": "a"})
+    assert conn.recv(timeout=5) == ("binary", {"fig_id": "f", "key": "k"}, b"\x00\n\x01")
+    assert conn.recv(timeout=5) == ("stream", "log line")
+
+
+def test_recv_timeout_raises_and_keeps_the_partial_unit(pair):
+    conn, peer, _ = pair
+    frame = encode_frame("f", "image", {"n": 1}, b"\x00\n\x01PLOTBIN:")
+    peer.sendall(b'PLOTAPP:{"type":"par')
+    with pytest.raises(TimeoutError):
+        conn.recv(timeout=0.2)
+    peer.sendall(b'tial"}\n' + frame[:10])
+    assert conn.recv(timeout=5) == ("message", {"type": "partial"})
+    with pytest.raises(TimeoutError):
+        conn.recv(timeout=0.2)
+    peer.sendall(frame[10:])
+    assert conn.recv(timeout=5) == (
+        "binary", {"n": 1, "fig_id": "f", "key": "image"}, b"\x00\n\x01PLOTBIN:",
+    )
+
+
+def test_units_received_before_eof_come_first_then_connection_error(pair):
+    conn, peer, _ = pair
+    peer.sendall(b'PLOTAPP:{"type":"last"}\n')
+    peer.shutdown(socket.SHUT_WR)
+    assert conn.recv(timeout=5) == ("message", {"type": "last"})
+    with pytest.raises(ConnectionError):
+        conn.recv(timeout=5)
+
+
+def test_eof_inside_a_unit_raises_connection_error(pair):
+    conn, peer, _ = pair
+    peer.sendall(b'PLOTAPP:{"type":')
+    peer.shutdown(socket.SHUT_WR)
+    with pytest.raises(ConnectionError, match="incomplete"):
+        conn.recv(timeout=5)
+
+
+def test_a_malformed_unit_on_the_wire_raises_value_error_and_the_next_one_decodes(pair):
+    conn, peer, _ = pair
+    peer.sendall(b'PLOTBIN:12:x\nPLOTAPP:{"type":"after"}\n')
+    with pytest.raises(ValueError) as excinfo:
+        conn.recv(timeout=5)
+    assert excinfo.value.line == b"PLOTBIN:12:x"
+    assert conn.recv(timeout=5) == ("message", {"type": "after"})
+
+
+def test_close_is_idempotent_and_later_calls_raise_connection_error(pair):
+    conn, _, _ = pair
+    conn.close()
+    conn.close()
+    with pytest.raises(ConnectionError):
+        conn.recv(timeout=0.1)
+    with pytest.raises(ConnectionError):
+        conn.send({"type": "late"})
+
+
+def test_a_short_recv_poll_on_one_thread_does_not_break_a_long_send_on_another(pair):
+    # The connector's shape: one thread polls recv() with a short timeout while
+    # another sends. A per-call socket timeout would cut a blocked send short
+    # (TimeoutError partway through a line: a corrupt stream); the client waits
+    # on a selector instead. Many 1 MiB sends, not one big one: Windows accepts
+    # a single large non-blocking send whole, so only later sends ever block.
+    conn, peer, _ = pair
+    count = 32
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def poll() -> None:
+        while not stop.is_set():
+            try:
+                conn.recv(timeout=0.01)
+            except TimeoutError:
+                continue
+            except BaseException as e:
+                errors.append(e)
+                return
+
+    received = bytearray()
+
+    def slow_reader() -> None:
+        time.sleep(0.3)  # the sends block on full socket buffers while the poller runs
+        try:
+            while received.count(b"\n") < count:
+                chunk = peer.recv(1 << 16)
+                if not chunk:
+                    return
+                received.extend(chunk)
+        except OSError:
+            return  # the sender gave up; the assertions below say why
+
+    poller = threading.Thread(target=poll, daemon=True)
+    reader = threading.Thread(target=slow_reader, daemon=True)
+    poller.start()
+    reader.start()
+    block = "x" * (1 << 20)
+    try:
+        for i in range(count):
+            conn.send({"type": "blob", "i": i, "data": block})
+    finally:
+        reader.join(timeout=30)
+        stop.set()
+        poller.join(timeout=5)
+    assert errors == []
+    lines = bytes(received).splitlines()
+    assert [json.loads(line)["i"] for line in lines] == list(range(count))
+    assert all(json.loads(line)["data"] == block for line in lines)
