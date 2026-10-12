@@ -85,6 +85,10 @@ de_shell = [
     "renderer/*.ts",
     "renderer/*.tsx",
     "testing/*.cjs",
+    "packaging/*.mjs",
+    "packaging/*.d.mts",
+    "packaging/*.nsh",
+    "packaging/*.yml",
 ]
 
 [tool.pytest.ini_options]

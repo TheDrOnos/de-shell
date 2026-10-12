@@ -1,0 +1,584 @@
+name: Electron release (reusable)
+
+# The release pipeline for a de-shell app, generalised from SpyDE's release.yml
+# so Ground Crew, Autopilot and SpyDE stop carrying three drifting copies.
+# An app calls it from its own tag-triggered workflow:
+#
+#   # .github/workflows/release.yml in the app's repo
+#   on:
+#     push: { tags: ["v*"] }
+#   jobs:
+#     release:
+#       permissions: { contents: write }
+#       uses: directelectron/de-shell/.github/workflows/electron-release.yml@v0.5.0
+#       with:
+#         app-name: Ground Crew
+#         wheelhouse-extras: gpu
+#         include-mingit: true
+#         azure-endpoint: https://eus.codesigning.azure.net
+#         azure-account: de-signing
+#         azure-profile: de-public-trust
+#         azure-publisher-name: Direct Electron
+#       secrets: inherit
+#
+# IT RUNS IN THE APP'S REPOSITORY: `actions/checkout` below checks out the
+# CALLER, and publishes to the caller's releases (GITHUB_TOKEN cannot publish
+# cross-repo anyway). This repo only supplies the pipeline, and the build
+# scripts it calls come from the de-shell wheel the app's lock installs
+# (electron/shell/packaging/…), so the pipeline and the scripts cannot be at
+# different versions than the app expects.
+#
+# The app must provide: electron/package.json with a `deShell` block (appId,
+# pythonDist, pythonVersion …; see packaging/bundle-python.mjs), a committed
+# uv.lock, an electron-builder.yml that extends
+# shell/packaging/electron-builder.base.yml, and a build script reachable as
+# `electron-vite build`.
+#
+# Job order is load-bearing, as in the SpyDE original: the release is CREATED
+# once, sequentially, BEFORE the matrix -- electron-builder's GitHub publisher
+# finds-or-creates a release by tag, and parallel matrix legs hitting that
+# together is a known race (electron-builder#6676, duplicate drafts).
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Display name, used in the release title and the wheelhouse zip name.
+        type: string
+        required: true
+      electron-dir:
+        description: The app's Electron project directory, relative to the repo root.
+        type: string
+        default: electron
+      python-dir:
+        description: The uv project (pyproject.toml, uv.lock), relative to the repo root.
+        type: string
+        default: "."
+      npm-dir:
+        description: Where package-lock.json lives (`npm ci` runs here), relative to the repo root.
+        type: string
+        default: "."
+      builder-config:
+        description: electron-builder config file, relative to electron-dir.
+        type: string
+        default: electron-builder.yml
+      platforms:
+        description: JSON array of runner labels to build on.
+        type: string
+        default: '["windows-latest","macos-latest","ubuntu-latest"]'
+      wheelhouse-extras:
+        description: >-
+          Comma-separated extras to include in the offline Windows wheelhouse
+          (e.g. "gpu"). Empty builds the wheelhouse with no extras.
+        type: string
+        default: ""
+      wheelhouse:
+        description: Build the offline wheelhouse and attach its zip to the release (Windows leg only).
+        type: boolean
+        default: true
+      wheelhouse-platform:
+        description: pip platform tag of the wheelhouse.
+        type: string
+        default: win_amd64
+      include-mingit:
+        description: Vendor MinGit into the Windows installer (for git+https dependencies).
+        type: boolean
+        default: false
+      mingit-version:
+        type: string
+        default: "2.51.0"
+      mingit-tag:
+        type: string
+        default: "v2.51.0.windows.1"
+      uv-version:
+        description: >-
+          Pinned, never "latest": resolving latest hits the GitHub API and took out every leg during an API outage.
+        type: string
+        default: "0.10.11"
+      node-version:
+        type: string
+        default: "24"
+      sentry-dsn-env:
+        description: Name of the env var the app reads its Sentry DSN from (e.g. SPYDE_SENTRY_DSN). Empty = none.
+        type: string
+        default: ""
+      azure-endpoint:
+        description: Azure Trusted Signing endpoint. Signing happens only if this AND the Azure secrets are set.
+        type: string
+        default: ""
+      azure-account:
+        description: Azure Trusted Signing code-signing account name.
+        type: string
+        default: ""
+      azure-profile:
+        description: Azure Trusted Signing certificate profile name.
+        type: string
+        default: ""
+      azure-publisher-name:
+        description: Publisher (certificate subject) name for azureSignOptions.
+        type: string
+        default: ""
+    secrets:
+      SENTRY_DSN:
+        required: false
+      MAC_CERT_P12_BASE64:
+        required: false
+      MAC_CERT_PASSWORD:
+        required: false
+      APPLE_API_KEY_P8:
+        required: false
+      APPLE_API_KEY_ID:
+        required: false
+      APPLE_API_ISSUER_ID:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_CLIENT_SECRET:
+        required: false
+
+jobs:
+  # ── Derive the update channel from the tag shape (stable vs beta) ───────────
+  # Plain vX.Y.Z -> stable. Any prerelease suffix (-rc.N / -beta.N / -alpha.N)
+  # -> beta. electron-updater understands GitHub's own "prerelease" flag
+  # natively (allowPrerelease gates on it), so this one regex is what the whole
+  # channel feature hinges on downstream.
+  channel:
+    name: Derive channel from tag
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.detect.outputs.channel }}
+      prerelease: ${{ steps.detect.outputs.prerelease }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - name: Detect channel + version from tag
+        id: detect
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=beta" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+  # ── Create the (draft) release BEFORE the matrix builds ─────────────────────
+  # CRITICAL -- the release MUST be a DRAFT when the builds publish into it.
+  # electron-builder's GitHub publisher only uploads into an EXISTING release
+  # when that release is a draft; if it finds a NON-draft one it skips every
+  # asset ("existing type not compatible with publishing type") and, because
+  # that skip is non-fatal, the run goes GREEN with an EMPTY release. That
+  # shipped an asset-less release once. So we do NOT set `prerelease:` here and
+  # we FORCE the release back to draft if it already exists; the prerelease flag
+  # is applied in `finalize`, after the assets attach.
+  prepare-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    needs: channel
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ inputs.app-name }} ${{ github.ref_name }}
+          draft: true
+          body: |
+            ## ${{ inputs.app-name }} ${{ github.ref_name }}
+
+            Desktop app (Electron) with a uv-managed Python backend. The
+            installer is small: the Python environment is set up on **first
+            launch**, which needs a network connection and may take a few
+            minutes -- or, on a machine with no network, from the offline
+            wheelhouse zip below. Later launches are instant.
+
+            ${{ needs.channel.outputs.channel == 'beta' && '**Beta channel** — only offered to users who opted into beta updates.' || '' }}
+
+            ### Downloads
+            | Platform | File |
+            |----------|------|
+            | Windows  | `* Setup *.exe` (NSIS installer) |
+            | macOS    | `*.dmg` |
+            | Linux    | `*.AppImage` |
+            | Offline (Windows) | `*-wheels-win_amd64.zip` -- every dependency plus Python, for installs with no network |
+          generate_release_notes: true
+
+      # softprops/action-gh-release only CREATES a draft; if a release for this
+      # tag already exists it just updates it and leaves its draft flag alone.
+      # Force draft, and strip assets a prior half-run left attached, so the
+      # "release has assets" check reflects THIS run only.
+      - name: Force the release to draft (and clear stale assets)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release edit "$TAG" --repo "$REPO" --draft=true
+          assets=$(gh release view "$TAG" --repo "$REPO" \
+                     --json assets --jq '.assets[].name' 2>/dev/null || true)
+          for a in $assets; do
+            echo "Removing stale asset: $a"
+            gh release delete-asset "$TAG" "$a" --repo "$REPO" --yes || true
+          done
+
+  # ── Build the Electron app + staged Python sidecar on each platform ─────────
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [channel, prepare-release]
+    permissions:
+      contents: write      # electron-builder publishes assets to the release
+    # The `secrets` context is NOT available in step-level `if:` -- only `env`
+    # is. So surface "is signing configured?" as job-level env flags the steps
+    # can gate on (a fork / secret-less run then produces an unsigned build).
+    env:
+      MAC_SIGNING_ENABLED: ${{ secrets.MAC_CERT_P12_BASE64 != '' && 'true' || 'false' }}
+      AZURE_SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && inputs.azure-endpoint != '' && 'true' || 'false' }}
+    # windows-latest's default shell is PowerShell, which has killed releases
+    # before (bash version guards that do not parse; npm.cmd mangling
+    # -c.publish.repo=x into a config FILE path). Every step is POSIX or a
+    # command verified under Git Bash, so default the whole job.
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: true        # abort all legs if one fails -- keeps releases clean
+      matrix:
+        os: ${{ fromJSON(inputs.platforms) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        # Full history + tags so setuptools_scm derives the real version from
+        # the pushed tag (a shallow checkout has none -> 0.0.postN.devN).
+        with:
+          fetch-depth: 0
+
+      # electron/package.json's "version" is what electron-builder and
+      # electron-updater treat as the app's semver; a drift from the tag would
+      # ship an installer the updater cannot reason about. Fail fast.
+      - name: Verify electron package.json version matches the pushed tag
+        run: |
+          pkg_version=$(node -p "require('./${{ inputs.electron-dir }}/package.json').version")
+          tag_version="${{ needs.channel.outputs.version }}"
+          if [ "$pkg_version" != "$tag_version" ]; then
+            echo "::error::${{ inputs.electron-dir }}/package.json version ($pkg_version) does not match tag v$tag_version"
+            exit 1
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # bundle-python.mjs ships the `uv` on PATH when electron/vendor/uv/ is
+      # absent, so installing uv here is what populates the shipped binary.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ inputs.uv-version }}
+          enable-cache: true
+
+      # The installer bundles pyproject.toml + uv.lock and resolves the venv on
+      # the USER's first launch, so an out-of-sync lock would ship a broken
+      # installer that only fails for them.
+      - name: Verify uv.lock is in sync with pyproject.toml
+        working-directory: ${{ inputs.python-dir }}
+        run: uv lock --check
+
+      # AppImage tooling needs FUSE on the runner.
+      - name: Install Linux packaging deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends fuse libfuse2
+
+      # `uv sync` resolves git+https dependencies by shelling out to `git`, and
+      # a clean Windows user machine often has NO git. bundle-python.mjs stages
+      # vendor/git/win32 into the installer; this populates it with MinGit.
+      - name: Vendor MinGit (Windows)
+        if: runner.os == 'Windows' && inputs.include-mingit
+        env:
+          MINGIT_VER: ${{ inputs.mingit-version }}
+          MINGIT_TAG: ${{ inputs.mingit-tag }}
+        run: |
+          dest="${{ inputs.electron-dir }}/vendor/git/win32"
+          mkdir -p "$dest"
+          url="https://github.com/git-for-windows/git/releases/download/${MINGIT_TAG}/MinGit-${MINGIT_VER}-64-bit.zip"
+          echo "Downloading $url"
+          curl -fsSL -o mingit.zip "$url"
+          unzip -q mingit.zip -d "$dest"
+          test -f "$dest/cmd/git.exe" || test -f "$dest/bin/git.exe"
+          "$dest/cmd/git.exe" --version || "$dest/bin/git.exe" --version
+
+      - name: Install npm dependencies
+        working-directory: ${{ inputs.npm-dir }}
+        run: npm ci
+
+      # The shell's TypeScript ships INSIDE the de-shell wheel; electron/shell
+      # is a link to it. `uv run` syncs the locked environment first (the same
+      # install the app's tests use), then the stdlib CLI makes the link.
+      # Heavy for an app with a big science stack, but it is the one honest way
+      # to get the version the lock pins -- the link has to point at THAT.
+      - name: Link the shell (python -m de_shell.js link)
+        working-directory: ${{ inputs.python-dir }}
+        run: uv run --frozen --no-dev python -m de_shell.js link "${GITHUB_WORKSPACE}/${{ inputs.electron-dir }}"
+
+      # ── macOS code signing (only when secrets are present) ───────────────────
+      # Import the Developer ID Application cert into a throwaway keychain so
+      # electron-builder can sign + (with notarize:true) notarize. A fork /
+      # secret-less run skips it and electron-builder produces an unsigned build.
+      - name: Import Apple signing certificate (macOS only)
+        if: runner.os == 'macOS' && env.MAC_SIGNING_ENABLED == 'true'
+        env:
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PW=$(openssl rand -base64 24)
+          echo "$MAC_CERT_P12_BASE64" | base64 --decode > cert.p12
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import cert.p12 -k "$KEYCHAIN" -P "$MAC_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # The Developer ID G2 intermediate, in case the .p12 did not bundle it.
+          curl -fsSO https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import DeveloperIDG2CA.cer -k "$KEYCHAIN" || true
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm -f cert.p12 DeveloperIDG2CA.cer
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      # electron-builder's notarize step wants APPLE_API_KEY as a PATH to the .p8.
+      - name: Stage notarization API key (macOS only)
+        if: runner.os == 'macOS' && env.MAC_SIGNING_ENABLED == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/apple_api_key.p8"
+          echo "APPLE_API_KEY=$RUNNER_TEMP/apple_api_key.p8" >> "$GITHUB_ENV"
+
+      # Where Help -> Report a Problem sends reports. A Sentry DSN is a
+      # write-only public key, so baking it into the build is how Sentry is
+      # meant to be used; it lives in secrets so it can be rotated without a
+      # release, and so a fork builds with reporting simply off (reports are
+      # then written to the user's data directory). The variable NAME is the
+      # app's (`sentry-dsn-env`), exported here for the bundler that reads it.
+      - name: Export the Sentry DSN
+        if: inputs.sentry-dsn-env != ''
+        env:
+          SENTRY_DSN_VALUE: ${{ secrets.SENTRY_DSN }}
+          SENTRY_DSN_NAME: ${{ inputs.sentry-dsn-env }}
+        run: |
+          if [ -n "$SENTRY_DSN_VALUE" ]; then
+            echo "::add-mask::$SENTRY_DSN_VALUE"
+            echo "$SENTRY_DSN_NAME=$SENTRY_DSN_VALUE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build renderer + main (electron-vite)
+        working-directory: ${{ inputs.electron-dir }}
+        run: npx electron-vite build
+
+      # Stage the Python sidecar payload (see packaging/bundle-python.mjs). All
+      # configuration comes from electron/package.json's `deShell` block; the
+      # only flag is MinGit: required where we vendored it, off elsewhere.
+      - name: Stage the Python payload
+        working-directory: ${{ inputs.electron-dir }}
+        run: |
+          flags=()
+          if [ "${{ inputs.include-mingit }}" = "true" ]; then
+            [ "$RUNNER_OS" = "Windows" ] && flags+=(--mingit)
+          else
+            flags+=(--no-mingit)
+          fi
+          node shell/packaging/bundle-python.mjs "${flags[@]}"
+
+      # electron-builder --publish always: finds the draft `prepare-release`
+      # created (by tag) and uploads this platform's installer PLUS the
+      # update-feed metadata (latest.yml / latest-mac.yml / latest-linux.yml)
+      # electron-updater reads. -c.publish.owner/.repo pin the publish target to
+      # THE REPO THIS WORKFLOW RUNS IN, so a static owner in the app's config
+      # can neither 404 the build nor survive a repo transfer stale.
+      # Windows signing is opt-in via -c.win.azureSignOptions.* (Azure Trusted
+      # Signing; the AZURE_* env below is what its credential chain reads).
+      # electron-builder's "skipped publishing" is a NON-FATAL warning -- it
+      # exits 0 while attaching ZERO assets -- so tee the output and hard-fail
+      # on it: the tripwire that catches an empty release at build time.
+      - name: Build + publish desktop app
+        working-directory: ${{ inputs.electron-dir }}
+        run: |
+          set -o pipefail
+          args=(--config "${{ inputs.builder-config }}" --publish always
+                "-c.publish.owner=${{ github.repository_owner }}"
+                "-c.publish.repo=${{ github.event.repository.name }}")
+          if [ "$RUNNER_OS" = "Windows" ] && [ "$AZURE_SIGNING_ENABLED" = "true" ]; then
+            args+=("-c.win.azureSignOptions.endpoint=${{ inputs.azure-endpoint }}"
+                   "-c.win.azureSignOptions.codeSigningAccountName=${{ inputs.azure-account }}"
+                   "-c.win.azureSignOptions.certificateProfileName=${{ inputs.azure-profile }}")
+            if [ -n "${{ inputs.azure-publisher-name }}" ]; then
+              args+=("-c.win.azureSignOptions.publisherName=${{ inputs.azure-publisher-name }}")
+            fi
+          fi
+          npx electron-builder "${args[@]}" 2>&1 | tee eb-publish.log
+          if grep -qiE "skipped publishing|GitHub release not created" eb-publish.log; then
+            echo "::error::electron-builder SKIPPED publishing assets — the release is not a writable draft. See the 'skipped publishing' / 'release not created' lines above."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      # The offline wheelhouse: every locked wheel for one platform plus the
+      # Python interpreter, zipped and attached to the SAME release so a lab
+      # machine with no network can install from a file. Built on the Windows
+      # leg only (that is the platform that needs it; the tool can target any
+      # platform from any host). The zip name is <App>-<version>-wheels-<plat>.zip.
+      - name: Build + attach the offline wheelhouse
+        if: runner.os == 'Windows' && inputs.wheelhouse
+        working-directory: ${{ inputs.electron-dir }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          EXTRAS: ${{ inputs.wheelhouse-extras }}
+          APP_NAME: ${{ inputs.app-name }}
+          PLATFORM: ${{ inputs.wheelhouse-platform }}
+        run: |
+          flags=()
+          IFS=',' read -ra xs <<< "$EXTRAS"
+          for x in "${xs[@]}"; do
+            x="${x// /}"
+            [ -n "$x" ] && flags+=(--extra "$x")
+          done
+          node shell/packaging/build-wheelhouse.mjs \
+            --platform "$PLATFORM" --app-name "$APP_NAME" --zip "${flags[@]}"
+          zip_file=$(ls ./*-wheels-"$PLATFORM".zip)
+          gh release upload "$TAG" "$zip_file" --repo "$REPO" --clobber
+
+      - name: Upload build artifacts (for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ runner.os }}
+          path: |
+            ${{ inputs.electron-dir }}/dist/*.exe
+            ${{ inputs.electron-dir }}/dist/*.dmg
+            ${{ inputs.electron-dir }}/dist/*.zip
+            ${{ inputs.electron-dir }}/dist/*.AppImage
+          if-no-files-found: error
+
+  # ── Un-draft the release now that every leg has published ───────────────────
+  finalize:
+    name: Publish (un-draft) the release
+    runs-on: ubuntu-latest
+    needs: [channel, build]   # only runs when ALL build legs pass
+    permissions:
+      contents: write
+    steps:
+      # Last line of defence: every leg went green, but confirm assets ACTUALLY
+      # landed. A release with no installers is worse than a failed run (it
+      # looks shippable), so refuse to un-draft an empty one. Each platform
+      # contributes at least an installer, its blockmap or feed -- 3 apiece is
+      # the usual; require 2 per platform as the floor.
+      - name: Verify the release has assets before publishing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          count=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets | length')
+          legs=$(printf '%s' "$PLATFORMS" | grep -o ',' | wc -l)
+          legs=$((legs + 1))
+          echo "Release $TAG has $count asset(s); expected at least $((legs * 2))."
+          gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name'
+          if [ "$count" -lt $((legs * 2)) ]; then
+            echo "::error::Release $TAG has only $count assets — the installers did not attach. Refusing to publish an empty release."
+            exit 1
+          fi
+
+      # AUTO-UPDATE FEED GATE. electron-updater reads latest*.yml to decide what
+      # to download; on macOS it CANNOT apply a .dmg, only a .zip. A dmg-only
+      # mac feed builds and publishes fine yet every mac auto-update then fails.
+      # Validate each built platform's feed references an INSTALLABLE payload
+      # AND that the referenced file is an attached asset.
+      - name: Validate the auto-update feeds are installable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          mapfile -t ASSETS < <(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          has_asset() { for a in "${ASSETS[@]}"; do [ "$a" = "$1" ] && return 0; done; return 1; }
+
+          # feed file -> the extension(s) electron-updater can install from it,
+          # for the platforms this run built.
+          declare -A FEED_EXT=()
+          case "$PLATFORMS" in *macos*)   FEED_EXT[latest-mac.yml]='\.zip$' ;; esac
+          case "$PLATFORMS" in *windows*) FEED_EXT[latest.yml]='\.(exe|nupkg)$' ;; esac
+          case "$PLATFORMS" in *ubuntu*)  FEED_EXT[latest-linux.yml]='\.(AppImage|deb|rpm)$' ;; esac
+
+          # This runs while the release is STILL A DRAFT, whose assets are not
+          # reachable at the public releases/download/<tag>/ URL (404), so go
+          # through the API with `gh release download`.
+          tmp=$(mktemp -d)
+          fail=0
+          for feed in "${!FEED_EXT[@]}"; do
+            if ! has_asset "$feed"; then
+              echo "::error::update feed $feed is not attached to the release — electron-updater can't detect updates on that platform."
+              fail=1; continue
+            fi
+            if ! gh release download "$TAG" --repo "$REPO" --pattern "$feed" --dir "$tmp" --clobber; then
+              echo "::error::could not download update feed $feed from the (draft) release."
+              fail=1; continue
+            fi
+            body=$(cat "$tmp/$feed")
+            mapfile -t urls < <(printf '%s\n' "$body" | sed -nE 's/^[[:space:]]*-?[[:space:]]*url:[[:space:]]*//p')
+            if [ "${#urls[@]}" -eq 0 ]; then
+              echo "::error::$feed lists no files — malformed update feed."; fail=1; continue
+            fi
+            want="${FEED_EXT[$feed]}"
+            ok=0
+            for u in "${urls[@]}"; do
+              u="${u%$'\r'}"
+              if printf '%s' "$u" | grep -qiE "$want"; then
+                if has_asset "$u"; then ok=1; echo "  $feed -> $u ok"; else
+                  echo "::error::$feed references '$u' but it is NOT an attached asset."; fail=1
+                fi
+              fi
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "::error::$feed has no installable payload (need $want). Files: ${urls[*]}. On macOS a dmg-only feed CANNOT auto-update — add the zip target."
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || { echo "::error::auto-update feed validation failed — refusing to publish a release users can't update from."; exit 1; }
+          echo "All auto-update feeds reference an installable, attached payload."
+
+      # Un-draft AND stamp the channel: the prerelease flag is applied HERE (not
+      # at draft-creation) so the release stays a plain draft during the upload
+      # phase -- see the prepare-release note.
+      - name: Publish the release (un-draft + set channel)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.channel.outputs.prerelease }}
+        run: |
+          gh release edit "$TAG" --repo "$REPO" \
+            --draft=false --prerelease="$PRERELEASE"
