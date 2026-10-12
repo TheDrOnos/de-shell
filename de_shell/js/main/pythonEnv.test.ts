@@ -16,7 +16,11 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { configureShell } from './config.ts'
-import { findUv, resolvePythonEnv } from './pythonEnv.ts'
+import {
+  findUv, resolvePythonEnv, hasNvidiaGpu, readWheelhouse, findWheelhouse,
+  wheelhouseCandidates, lockStamp, buildSyncArgs, offlinePlan, effectiveExtras,
+  gpuEnvOverride, platformMatches, fileUrl, checkWheelhouseExtras, venvPython,
+} from './pythonEnv.ts'
 
 configureShell({
   appId: 'testapp',
@@ -134,4 +138,146 @@ test('dev-mode resolvePythonEnv leaves a bare uv when none is found (the spawn t
       else process.env[k] = v
     }
   }
+})
+
+// ── extras, GPU probe, stamp ─────────────────────────────────────────────────
+
+test('lockStamp is the bare hash with no extras (existing installs do not re-sync)', () => {
+  assert.equal(lockStamp('abc', []), 'abc')
+})
+
+test('lockStamp appends sorted extras, order-insensitively', () => {
+  assert.equal(lockStamp('abc', ['gpu', 'cuda']), 'abc+extras=cuda,gpu')
+  assert.equal(lockStamp('abc', ['cuda', 'gpu']), lockStamp('abc', ['gpu', 'cuda']))
+})
+
+test('effectiveExtras adds gpuExtras only with a GPU, de-duplicated', () => {
+  assert.deepEqual(effectiveExtras(['a'], ['gpu'], false), ['a'])
+  assert.deepEqual(effectiveExtras(['a'], ['gpu'], true), ['a', 'gpu'])
+  assert.deepEqual(effectiveExtras(['gpu'], ['gpu'], true), ['gpu'])
+  assert.deepEqual(effectiveExtras(undefined, undefined, true), [])
+})
+
+test('buildSyncArgs passes --extra for each extra, torch skip last', () => {
+  assert.deepEqual(
+    buildSyncArgs(['--no-install-project'], ['gpu', 'x'], ['torch']),
+    ['sync', '--frozen', '--no-dev', '--no-install-project',
+     '--extra', 'gpu', '--extra', 'x', '--no-install-package', 'torch'])
+  assert.deepEqual(buildSyncArgs([], []), ['sync', '--frozen', '--no-dev'])
+})
+
+const runner = (code: number | null, stdout = '') => async () => ({ code, stdout })
+
+test('hasNvidiaGpu parses nvidia-smi -L output', async () => {
+  assert.equal(await hasNvidiaGpu(runner(0, 'GPU 0: NVIDIA RTX A4000 (UUID: GPU-1)\n')), true)
+  assert.equal(await hasNvidiaGpu(runner(0, '')), false)
+  assert.equal(await hasNvidiaGpu(runner(0, 'No devices were found')), false)
+  assert.equal(await hasNvidiaGpu(runner(9, 'GPU 0: x')), false)
+  assert.equal(await hasNvidiaGpu(runner(null)), false)
+})
+
+test('hasNvidiaGpu never throws and asks for a ~5 s timeout', async () => {
+  assert.equal(await hasNvidiaGpu(async () => { throw new Error('ENOENT') }), false)
+  let seen: unknown[] = []
+  await hasNvidiaGpu(async (cmd, args, t) => { seen = [cmd, args, t]; return { code: 1, stdout: '' } })
+  assert.deepEqual(seen, ['nvidia-smi', ['-L'], 5000])
+})
+
+test('gpuEnvOverride reads <APPID>_GPU', () => {
+  assert.equal(gpuEnvOverride({ TESTAPP_GPU: '0' }), false)
+  assert.equal(gpuEnvOverride({ TESTAPP_GPU: '1' }), true)
+  assert.equal(gpuEnvOverride({ TESTAPP_GPU: '' }), undefined)
+  assert.equal(gpuEnvOverride({}), undefined)
+})
+
+// ── wheelhouse ───────────────────────────────────────────────────────────────
+
+function wheelhouseDir(manifest: unknown): string {
+  const dir = tempDir('wheelhouse-')
+  writeFileSync(join(dir, 'wheelhouse.json'),
+    typeof manifest === 'string' ? manifest : JSON.stringify(manifest))
+  return dir
+}
+
+const goodManifest = {
+  app: 'testapp', version: '1.2.3', platform: 'win_amd64', python: '3.13.12', extras: ['gpu'],
+}
+
+test('readWheelhouse parses a valid manifest', () => {
+  assert.deepEqual(readWheelhouse(wheelhouseDir(goodManifest)), goodManifest)
+})
+
+test('readWheelhouse is null for missing, unparseable, or foreign manifests', () => {
+  assert.equal(readWheelhouse(emptyDir()), null)
+  assert.equal(readWheelhouse(wheelhouseDir('{not json')), null)
+  assert.equal(readWheelhouse(wheelhouseDir({ ...goodManifest, app: 'other' })), null)
+})
+
+test('findWheelhouse returns the first valid directory', () => {
+  const a = wheelhouseDir({ ...goodManifest, app: 'other' })
+  const b = wheelhouseDir(goodManifest)
+  const c = wheelhouseDir({ ...goodManifest, version: '9' })
+  const found = findWheelhouse([emptyDir(), a, b, c])
+  assert.equal(found?.dir, b)
+  assert.equal(found?.manifest.version, '1.2.3')
+  assert.equal(findWheelhouse([emptyDir()]), null)
+})
+
+test('wheelhouseCandidates are ordered option, env, resources, userData, exec dir', () => {
+  const got = wheelhouseCandidates(
+    { wheelhouse: '/opt', resourcesPath: '/res', userData: '/ud' },
+    { TESTAPP_WHEELHOUSE: '/env' },
+    join('/bin', 'app.exe'),
+  )
+  assert.deepEqual(got, ['/opt', '/env', join('/res', 'wheelhouse'),
+    join('/ud', 'wheelhouse'), join('/bin', 'wheelhouse')])
+  // Unset option / env are skipped, not left as holes.
+  assert.deepEqual(
+    wheelhouseCandidates({ wheelhouse: null, resourcesPath: '/res', userData: '/ud' }, {}, '/bin/app'),
+    [join('/res', 'wheelhouse'), join('/ud', 'wheelhouse'), join('/bin', 'wheelhouse')])
+})
+
+test('platformMatches is loose but os/arch aware', () => {
+  assert.equal(platformMatches('win_amd64', 'win32', 'x64'), true)
+  assert.equal(platformMatches('win_amd64', 'linux', 'x64'), false)
+  assert.equal(platformMatches('manylinux_2_28_x86_64', 'linux', 'x64'), true)
+  assert.equal(platformMatches('macosx_11_0_arm64', 'darwin', 'arm64'), true)
+  assert.equal(platformMatches('macosx_11_0_arm64', 'darwin', 'x64'), false)
+})
+
+test('fileUrl uses forward slashes with a three-slash drive form', () => {
+  assert.equal(fileUrl('C:\\wh\\python'), 'file:///C:/wh/python')
+  assert.equal(fileUrl('/wh/python'), 'file:///wh/python')
+})
+
+test('offlinePlan builds the python, venv, export, pip-install sequence', () => {
+  const plan = offlinePlan({
+    wheelhouse: join('/wh'), manifest: { python: '3.13.12' },
+    envDir: join('/ud', 'python-env'), userData: '/ud', extras: ['gpu'],
+  })
+  assert.equal(plan.env.UV_OFFLINE, '1')
+  assert.equal(plan.env.UV_PYTHON_DOWNLOADS, 'automatic')
+  assert.ok(plan.env.UV_PYTHON_INSTALL_MIRROR.startsWith('file://'))
+  assert.ok(plan.env.UV_PYTHON_INSTALL_MIRROR.endsWith('/python'))
+  assert.deepEqual(plan.python, ['python', 'install', '3.13.12'])
+  assert.deepEqual(plan.venv, ['venv', '--python', '3.13.12', '--managed-python',
+    '--allow-existing', join('/ud', 'python-env')])
+  assert.deepEqual(plan.export.slice(0, 7),
+    ['export', '--frozen', '--no-dev', '--no-emit-project', '--no-emit-workspace',
+     '--extra', 'gpu'])
+  assert.equal(plan.export.at(-1), plan.requirementsFile)
+  assert.equal(plan.requirementsFile, join('/ud', 'requirements.offline.txt'))
+  for (const flag of ['--offline', '--no-index', '--require-hashes']) {
+    assert.ok(plan.install.includes(flag), flag)
+  }
+  assert.equal(plan.install[plan.install.indexOf('--find-links') + 1], join('/wh'))
+  assert.equal(plan.install[plan.install.indexOf('-r') + 1], plan.requirementsFile)
+  assert.equal(plan.install.at(-1), venvPython(join('/ud', 'python-env')))
+})
+
+test('checkWheelhouseExtras names the missing extra', () => {
+  const m = { ...goodManifest, extras: [] }
+  assert.throws(() => checkWheelhouseExtras(['gpu'], m), /built without the 'gpu' extra/)
+  checkWheelhouseExtras([], m)   // gpu disabled → not effective → fine
+  checkWheelhouseExtras(['gpu'], goodManifest)
 })

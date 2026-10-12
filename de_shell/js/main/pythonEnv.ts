@@ -21,16 +21,29 @@
  * path), so the working install path can never regress. macOS keeps the plain
  * sync (no CUDA pin there; PyPI torch already carries MPS).
  *
+ * Extras: `ShellConfig.pythonExtras` are always installed (`--extra X`) and
+ * `gpuExtras` only when an NVIDIA GPU is found (`hasNvidiaGpu`). The effective
+ * extras are folded into the lock stamp, so gaining a GPU or adding an extra
+ * re-syncs while an app with no extras keeps its bare-hash stamp (no re-sync on
+ * upgrade).
+ *
+ * Offline: when a WHEELHOUSE (see `readWheelhouse`) is found, the network is not
+ * touched at all — see `offlinePlan` for why this is venv + export + pip install
+ * rather than `uv sync`.
+ *
+ * No residue: every packaged uv call pins `UV_PYTHON_INSTALL_DIR` under
+ * userData, so uv's managed interpreters do not land in %APPDATA%\uv\python.
+ *
  * In development (no bundled payload) we fall back to `uv run` from the repo
  * root — exactly the previous behaviour.
  */
 import { spawn } from 'child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { createHash } from 'crypto'
-import { join } from 'path'
+import { dirname, join } from 'path'
 // Extension spelled out so node:test can load this module without a bundler
 // (native type-stripping resolves relative imports literally).
-import { shellConfig } from './config.ts'
+import { envPrefix, shellConfig } from './config.ts'
 
 export interface ResolvedPython {
   cmd: string[]      // argv to spawn, e.g. [pythonExe, '-m', 'spyde']  (module from ShellConfig)
@@ -43,6 +56,12 @@ export interface EnsureOptions {
   projectRoot: string     // repo root (dev) — holds pyproject.toml
   userData: string        // app.getPath('userData') — writable venv lives here
   onProgress?: (line: string) => void
+  /** Force the GPU decision (true = add `gpuExtras`, false = never), skipping
+   *  the `nvidia-smi` probe. Beats the `<APPID>_GPU` env var. */
+  gpu?: boolean
+  /** Explicit wheelhouse directory for an offline install; first candidate
+   *  (see `wheelhouseCandidates`). null/undefined = search the defaults. */
+  wheelhouse?: string | null
 }
 
 const isWin = process.platform === 'win32'
@@ -137,6 +156,246 @@ export function readLockedTorchVersion(projectDir: string): string | null {
   return pick.version.split('+')[0]   // "2.6.0+cu124" → "2.6.0"
 }
 
+// ── GPU probe ────────────────────────────────────────────────────────────────
+
+/** Runs a command and reports its exit code + stdout. Injectable so the probe's
+ *  parsing is testable without nvidia-smi. A spawn failure may reject or return
+ *  code null — `hasNvidiaGpu` treats both as "no GPU". */
+export type CommandRunner = (
+  cmd: string, args: string[], timeoutMs: number,
+) => Promise<{ code: number | null; stdout: string }>
+
+const defaultRunner: CommandRunner = (cmd, args, timeoutMs) =>
+  new Promise((resolve) => {
+    let out = ''
+    let settled = false
+    const done = (code: number | null) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ code, stdout: out })
+    }
+    let proc: ReturnType<typeof spawn>
+    // A hung driver must not hang app start-up: kill after the timeout.
+    const timer = setTimeout(() => { try { proc?.kill() } catch { /* gone */ } done(null) }, timeoutMs)
+    try {
+      proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    } catch { done(null); return }
+    proc.stdout?.on('data', (b: Buffer) => { out += b.toString() })
+    proc.on('error', () => done(null))   // nvidia-smi absent (ENOENT) → no GPU
+    proc.on('close', (code) => done(code))
+  })
+
+/**
+ * Is an NVIDIA GPU usable on this machine? `nvidia-smi -L` lists one
+ * `GPU 0: <name> (UUID: …)` line per device and ships with the driver, so it
+ * answers "driver + device present" — the condition under which the CuPy-style
+ * GPU extras can actually work. Never throws: a missing binary, non-zero exit,
+ * timeout or output without a `GPU ` line is simply false (a CPU install is
+ * always a safe fallback).
+ */
+export async function hasNvidiaGpu(run: CommandRunner = defaultRunner): Promise<boolean> {
+  try {
+    const { code, stdout } = await run('nvidia-smi', ['-L'], 5000)
+    return code === 0 && /^GPU /m.test(stdout ?? '')
+  } catch { return false }
+}
+
+/** The `<APPID>_GPU` override: '0'/'false' → false, '1'/'true' → true, else
+ *  undefined (no override). */
+export function gpuEnvOverride(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+  const v = (env[`${envPrefix()}_GPU`] ?? '').trim().toLowerCase()
+  if (v === '1' || v === 'true') return true
+  if (v === '0' || v === 'false') return false
+  return undefined
+}
+
+/** Effective extras, in config order, de-duplicated: `pythonExtras` plus
+ *  `gpuExtras` when `gpu`. Pure. */
+export function effectiveExtras(
+  pythonExtras: string[] | undefined, gpuExtras: string[] | undefined, gpu: boolean,
+): string[] {
+  return [...new Set([...(pythonExtras ?? []), ...(gpu ? (gpuExtras ?? []) : [])])]
+}
+
+/**
+ * The stamp written to `.<appId>-lock-hash`. With NO extras it is the bare
+ * sha256 of uv.lock — byte-identical to what earlier versions wrote, so
+ * upgrading de-shell does not force every existing install to re-sync. With
+ * extras it is `<hash>+extras=<sorted,comma-joined>` so a new extra, or a
+ * machine gaining a GPU, re-syncs (order-insensitive: config order is not
+ * semantic).
+ */
+export function lockStamp(lockHash: string, extras: string[]): string {
+  return extras.length ? `${lockHash}+extras=${[...extras].sort().join(',')}` : lockHash
+}
+
+/** `['--extra','a','--extra','b']` for `uv sync` / `uv export`. */
+export function extraArgs(extras: string[]): string[] {
+  return extras.flatMap((e) => ['--extra', e])
+}
+
+/** Every `uv sync` argv in one place so the torch two-step and the plain
+ *  fallback cannot drift apart on extras. `skipPackages` → `--no-install-package`. */
+export function buildSyncArgs(
+  projectArgs: string[], extras: string[], skipPackages: string[] = [],
+): string[] {
+  return [
+    'sync', '--frozen', '--no-dev', ...projectArgs, ...extraArgs(extras),
+    ...skipPackages.flatMap((p) => ['--no-install-package', p]),
+  ]
+}
+
+// ── Wheelhouse (offline install) ─────────────────────────────────────────────
+
+/** `wheelhouse.json`, written by the wheelhouse builder. The directory beside
+ *  it holds a flat set of `*.whl` plus `python/<release-tag>/<archive>`, a
+ *  `uv python install` mirror. */
+export interface WheelhouseManifest {
+  app: string
+  version: string
+  platform: string   // e.g. 'win_amd64'
+  python: string     // full version, e.g. '3.13.12'
+  extras: string[]
+}
+
+/** Parsed manifest, or null when missing/unparseable/for another app. */
+export function readWheelhouse(dir: string): WheelhouseManifest | null {
+  try {
+    const m = JSON.parse(readFileSync(join(dir, 'wheelhouse.json'), 'utf8'))
+    if (!m || typeof m !== 'object' || m.app !== shellConfig().appId) return null
+    return {
+      app: m.app,
+      version: String(m.version ?? ''),
+      platform: String(m.platform ?? ''),
+      python: String(m.python ?? ''),
+      extras: Array.isArray(m.extras) ? m.extras.map(String) : [],
+    }
+  } catch { return null }
+}
+
+/** First candidate directory holding a valid manifest for this app. */
+export function findWheelhouse(
+  candidates: string[],
+): { dir: string; manifest: WheelhouseManifest } | null {
+  for (const dir of candidates) {
+    const manifest = readWheelhouse(dir)
+    if (manifest) return { dir, manifest }
+  }
+  return null
+}
+
+/** Where to look for a wheelhouse, most explicit first: the option, the
+ *  `<APPID>_WHEELHOUSE` env var, beside the bundled payload, in userData (copied
+ *  there by hand), and next to the executable (a USB-stick-style install). */
+export function wheelhouseCandidates(
+  opts: Pick<EnsureOptions, 'wheelhouse' | 'resourcesPath' | 'userData'>,
+  env: NodeJS.ProcessEnv = process.env,
+  execPath: string = process.execPath,
+): string[] {
+  return [
+    opts.wheelhouse,
+    env[`${envPrefix()}_WHEELHOUSE`],
+    join(opts.resourcesPath, 'wheelhouse'),
+    join(opts.userData, 'wheelhouse'),
+    join(dirname(execPath), 'wheelhouse'),
+  ].filter((d): d is string => !!d)
+}
+
+/** Does a wheel platform tag (`win_amd64`, `manylinux_2_28_x86_64`,
+ *  `macosx_11_0_arm64`) plausibly describe this machine? Deliberately loose —
+ *  it only drives a warning; uv's hash check is the real guard. */
+export function platformMatches(
+  tag: string, platform: string = process.platform, arch: string = process.arch,
+): boolean {
+  const t = tag.toLowerCase()
+  const osOk = platform === 'win32' ? t.startsWith('win')
+    : platform === 'darwin' ? t.startsWith('macosx')
+    : t.includes('linux')
+  const archs: Record<string, string[]> = {
+    x64: ['amd64', 'x86_64'], arm64: ['arm64', 'aarch64'], ia32: ['win32', 'i686'],
+  }
+  return osOk && (archs[arch] ?? [arch]).some((a) => t.includes(a))
+}
+
+/** `file:///C:/x/python` (Windows) or `file:///x/python` (posix). */
+export function fileUrl(dir: string): string {
+  const p = dir.replace(/\\/g, '/')
+  return p.startsWith('/') ? `file://${p}` : `file:///${p}`
+}
+
+export interface OfflinePlan {
+  /** Extra env for every offline uv call. */
+  env: Record<string, string>
+  /** argv (after `uv`) for each step, in order. */
+  python: string[]
+  venv: string[]
+  export: string[]
+  install: string[]
+  /** Where `uv export` writes the hashed requirements. */
+  requirementsFile: string
+}
+
+/**
+ * The offline install, as argv — pure so it is testable without spawning uv.
+ *
+ * Why not `uv sync --offline --find-links`: for a frozen sync uv only looks for
+ * registry-locked wheels in its CACHE, never in find-links, so it cannot
+ * install from a wheelhouse. Instead:
+ *   1. `uv python install <ver>` — the interpreter comes from the wheelhouse's
+ *      python-build-standalone mirror (UV_PYTHON_INSTALL_MIRROR=file://…).
+ *      It has to be its own step: under UV_OFFLINE `uv venv` refuses to fetch
+ *      an interpreter even from a file:// mirror ("a managed Python download
+ *      is available … but uv is set to offline mode"), while `uv python
+ *      install` treats the mirror as the source it was told to use.
+ *      Then `uv venv --managed-python` over the interpreter just installed.
+ *   2. `uv export --frozen` — reads only the lock (no network) and emits every
+ *      third-party pin WITH hashes.
+ *   3. `uv pip install --offline --no-index --find-links <wheelhouse>
+ *      --require-hashes` — lock-exact, hash-verified, no network. Torch is
+ *      therefore lock-exact too (no per-machine two-step).
+ * The staged member/app wheels are then installed by `installAppWheel` as usual.
+ */
+export function offlinePlan(p: {
+  wheelhouse: string
+  manifest: Pick<WheelhouseManifest, 'python'>
+  envDir: string
+  userData: string
+  extras: string[]
+}): OfflinePlan {
+  const requirementsFile = join(p.userData, 'requirements.offline.txt')
+  return {
+    env: {
+      UV_OFFLINE: '1',
+      UV_PYTHON_INSTALL_MIRROR: fileUrl(join(p.wheelhouse, 'python')),
+      UV_PYTHON_DOWNLOADS: 'automatic',
+    },
+    python: ['python', 'install', p.manifest.python],
+    venv: ['venv', '--python', p.manifest.python, '--managed-python',
+           '--allow-existing', p.envDir],
+    export: ['export', '--frozen', '--no-dev', '--no-emit-project', '--no-emit-workspace',
+             ...extraArgs(p.extras), '-o', requirementsFile],
+    install: ['pip', 'install', '--offline', '--no-index', '--find-links', p.wheelhouse,
+              '--require-hashes', '-r', requirementsFile, '--python', venvPython(p.envDir)],
+    requirementsFile,
+  }
+}
+
+/** Fail loudly when the wheelhouse lacks an extra we need. `gpuExtras` are only
+ *  required when `gpu` is true — a user who set gpu=false never asked for them,
+ *  and they are not in `extras` then. */
+export function checkWheelhouseExtras(extras: string[], manifest: WheelhouseManifest): void {
+  for (const e of extras) {
+    if (!manifest.extras.includes(e)) {
+      throw new Error(
+        `this wheelhouse was built without the '${e}' extra ` +
+        `(it has: ${manifest.extras.join(', ') || 'none'}). Rebuild it with '${e}', ` +
+        `or disable the GPU install with ${envPrefix()}_GPU=0 if '${e}' is a GPU extra.`,
+      )
+    }
+  }
+}
+
 /** Resolve the command to launch the app's backend, creating the venv if needed. */
 export async function resolvePythonEnv(opts: EnsureOptions): Promise<ResolvedPython> {
   const cfg = shellConfig()
@@ -157,17 +416,63 @@ export async function resolvePythonEnv(opts: EnsureOptions): Promise<ResolvedPyt
   const stampFile = join(envDir, `.${cfg.appId}-lock-hash`)
   const lockHash = createHash('sha256').update(readFileSync(bundledLock)).digest('hex')
 
-  // Skip the sync if the venv already matches the shipped lock.
+  // GPU decision: option > <APPID>_GPU > nvidia-smi probe. The probe only runs
+  // when the app declared gpuExtras — otherwise there is nothing to decide. An
+  // explicit choice (option or env var) is strict; a probed one may be dropped
+  // when the install source cannot satisfy it (see the wheelhouse branch below).
+  const gpuExtras = cfg.gpuExtras ?? []
+  const gpuExplicit = opts.gpu ?? gpuEnvOverride()
+  const gpu = gpuExtras.length === 0 ? false
+    : (gpuExplicit ?? await hasNvidiaGpu())
+  let extras = effectiveExtras(cfg.pythonExtras, gpuExtras, gpu)
+  let stamp = lockStamp(lockHash, extras)
+  // The stamp written when a probed GPU was dropped because the wheelhouse was
+  // built without the GPU extras. Accepting it below is what stops an
+  // air-gapped GPU machine from re-syncing — online, so failing — on every
+  // launch; a new lock, or an explicit <APPID>_GPU=1, re-evaluates.
+  const cpuOnly = effectiveExtras(cfg.pythonExtras, gpuExtras, false)
+  const gpuUnavailableStamp = `${lockStamp(lockHash, cpuOnly)}+gpu=unavailable`
+
+  // Skip the sync if the venv already matches the shipped lock AND extras.
+  const onDisk = existsSync(stampFile) ? readSafe(stampFile) : null
   const upToDate =
     existsSync(pythonExe) &&
-    existsSync(stampFile) &&
-    readSafe(stampFile) === lockHash
+    (onDisk === stamp ||
+      (gpu && gpuExplicit === undefined && onDisk === gpuUnavailableStamp))
 
   if (!upToDate) {
-    await setupEnv(bundledProject, envDir, readAppVersion(bundledProject), opts.onProgress)
+    if (gpuExtras.length) {
+      opts.onProgress?.(gpu
+        ? `[env-setup] ${gpuExplicit ? 'GPU install requested' : 'NVIDIA GPU detected'} → extras: ${gpuExtras.join(', ')}
+`
+        : `[env-setup] no NVIDIA GPU (or disabled) → skipping extras: ${gpuExtras.join(', ')}
+`)
+    }
+    const found = findWheelhouse(wheelhouseCandidates(opts))
+    if (found) {
+      // A probed GPU whose extras the wheelhouse lacks degrades to a CPU
+      // install rather than failing: the site still gets a working app, and
+      // the stamp remembers why. Anything else missing (an app extra, or a GPU
+      // the user asked for explicitly) fails in checkWheelhouseExtras.
+      const missingGpu = gpu && gpuExplicit === undefined &&
+        gpuExtras.some((e) => !found.manifest.extras.includes(e))
+      if (missingGpu) {
+        opts.onProgress?.(
+          `[env-setup] this wheelhouse has no GPU packages (${gpuExtras.join(', ')}); ` +
+          `installing without them. Set ${envPrefix()}_GPU=1 to require them.
+`)
+        extras = cpuOnly
+        stamp = gpuUnavailableStamp
+      }
+      checkWheelhouseExtras(extras, found.manifest)
+    }
+    await setupEnv({
+      projectDir: bundledProject, envDir, appVersion: readAppVersion(bundledProject),
+      extras, wheelhouse: found, onProgress: opts.onProgress,
+    })
     try {
       mkdirSync(envDir, { recursive: true })
-      writeFileSync(stampFile, lockHash, 'utf8')
+      writeFileSync(stampFile, stamp, 'utf8')
     } catch { /* a missing stamp just forces a re-sync next launch */ }
   }
 
@@ -197,7 +502,10 @@ function readAppVersion(projectDir: string): string {
  * exits 1 (the first-launch crash). Absent in dev (marker not present) → the
  * env is unchanged and setuptools_scm resolves from the repo's git history.
  */
-function uvEnv(envDir: string, appVersion: string, projectDir?: string): NodeJS.ProcessEnv {
+function uvEnv(
+  envDir: string, appVersion: string, projectDir?: string,
+  extraEnv: Record<string, string> = {},
+): NodeJS.ProcessEnv {
   // Pretend-version env for setuptools_scm. The dist-name–scoped var is the
   // precise one; the plain SETUPTOOLS_SCM_PRETEND_VERSION is a harmless
   // belt-and-braces fallback in case the dist name ever changes.
@@ -239,6 +547,12 @@ function uvEnv(envDir: string, appVersion: string, projectDir?: string): NodeJS.
     // Keep uv's own cache/tools next to the env so an air-gapped re-run is
     // self-contained and we never write into the read-only bundle.
     UV_CACHE_DIR: join(envDir, '..', 'uv-cache'),
+    // No residue outside userData: uv's managed interpreters default to
+    // %APPDATA%\uv\python (~/.local/share/uv/python), which an uninstall never
+    // cleans. Existing venvs keep working after this moves — their pyvenv.cfg
+    // records the absolute path of the interpreter they were created with.
+    UV_PYTHON_INSTALL_DIR: join(envDir, '..', 'python'),
+    ...extraEnv,
   }
 }
 
@@ -249,6 +563,7 @@ function runUv(
   args: string[],
   appVersion: string,
   onProgress?: (line: string) => void,
+  extraEnv: Record<string, string> = {},
 ): Promise<void> {
   const uv = join(projectDir, uvBinaryName())
   // Fall back to a resolved PATH/per-user uv if not bundled (dev builds).
@@ -256,7 +571,7 @@ function runUv(
   return new Promise((resolve, reject) => {
     const proc = spawn(uvCmd, args, {
       cwd: projectDir,
-      env: uvEnv(envDir, appVersion, projectDir),
+      env: uvEnv(envDir, appVersion, projectDir, extraEnv),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const relay = (b: Buffer) => onProgress?.(b.toString())
@@ -355,6 +670,7 @@ function installAppWheel(
   envDir: string,
   wheel: string,
   onProgress?: (line: string) => void,
+  offlineEnv?: Record<string, string>,
 ): Promise<void> {
   onProgress?.(
     `[env-setup] installing ${shellConfig().pythonDist} from wheel ` +
@@ -362,8 +678,9 @@ function installAppWheel(
   )
   return runUv(
     projectDir, envDir,
-    ['pip', 'install', '--no-deps', '--python', venvPython(envDir), wheel],
-    '', onProgress,
+    ['pip', 'install', ...(offlineEnv ? ['--offline'] : []), '--no-deps',
+     '--python', venvPython(envDir), wheel],
+    '', onProgress, offlineEnv,
   )
 }
 
@@ -379,12 +696,15 @@ function installAppWheel(
  * read-only source tree. In dev (no staged wheel) the project installs from
  * source as before. Logs which path ran to the progress stream.
  */
-async function setupEnv(
-  projectDir: string,
-  envDir: string,
-  appVersion: string,
-  onProgress?: (line: string) => void,
-): Promise<void> {
+async function setupEnv(o: {
+  projectDir: string
+  envDir: string
+  appVersion: string
+  extras: string[]
+  wheelhouse: { dir: string; manifest: WheelhouseManifest } | null
+  onProgress?: (line: string) => void
+}): Promise<void> {
+  const { projectDir, envDir, appVersion, extras, wheelhouse, onProgress } = o
   const wheel = stagedAppWheel(projectDir)
   const memberWheels = stagedMemberWheels(projectDir, wheel)
   // With a staged wheel, tell uv sync NOT to touch the project (the app builds
@@ -400,6 +720,29 @@ async function setupEnv(
     projectArgs.push('--no-install-package', wheelPackageName(memberWheel))
   }
 
+  if (wheelhouse) {
+    const { dir, manifest } = wheelhouse
+    if (!platformMatches(manifest.platform)) {
+      onProgress?.(`[env-setup] WARNING: wheelhouse is for ${manifest.platform}, this machine is ${process.platform}/${process.arch}\n`)
+    }
+    if (appVersion && manifest.version && manifest.version !== appVersion) {
+      onProgress?.(`[env-setup] WARNING: wheelhouse is for version ${manifest.version}, app is ${appVersion}\n`)
+    }
+    onProgress?.(`[env-setup] offline install from wheelhouse ${dir}\n`)
+    const plan = offlinePlan({ wheelhouse: dir, manifest, envDir, userData: join(envDir, '..'), extras })
+    mkdirSync(join(envDir, '..'), { recursive: true })
+    await runUv(projectDir, envDir, plan.python, appVersion, onProgress, plan.env)
+    await runUv(projectDir, envDir, plan.venv, appVersion, onProgress, plan.env)
+    await runUv(projectDir, envDir, plan.export, appVersion, onProgress, plan.env)
+    await runUv(projectDir, envDir, plan.install, appVersion, onProgress, plan.env)
+    for (const memberWheel of memberWheels) {
+      await installAppWheel(projectDir, envDir, memberWheel, onProgress, plan.env)
+    }
+    if (wheel) await installAppWheel(projectDir, envDir, wheel, onProgress, plan.env)
+    onProgress?.('[env-setup] offline install complete\n')
+    return
+  }
+
   const twoStep =
     (process.platform === 'win32' || process.platform === 'linux') &&
     readLockedTorchVersion(projectDir) !== null
@@ -412,7 +755,7 @@ async function setupEnv(
       // only torch-family package in the lock, so one exclusion covers it.
       await runUv(
         projectDir, envDir,
-        ['sync', '--frozen', '--no-dev', ...projectArgs, '--no-install-package', 'torch'],
+        buildSyncArgs(projectArgs, extras, ['torch']),
         appVersion, onProgress,
       )
       // Step 2: torch resolved for this machine.
@@ -434,7 +777,7 @@ async function setupEnv(
   }
 
   onProgress?.('[env-setup] running full locked uv sync\n')
-  await runUv(projectDir, envDir, ['sync', '--frozen', '--no-dev', ...projectArgs], appVersion, onProgress)
+  await runUv(projectDir, envDir, buildSyncArgs(projectArgs, extras), appVersion, onProgress)
   for (const memberWheel of memberWheels) {
     await installAppWheel(projectDir, envDir, memberWheel, onProgress)
   }

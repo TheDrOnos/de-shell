@@ -24,6 +24,16 @@ export interface ShellConfig {
    *  (e.g. module `spyde` / dist `spyde`). Used for the pre-built wheel prefix
    *  and the SETUPTOOLS_SCM_PRETEND_VERSION_FOR_<NAME> env var. */
   pythonDist?: string
+  /** Optional-dependency groups (`[project.optional-dependencies]`) the packaged
+   *  first-run install ALWAYS adds, each as `uv sync --extra <name>`. Changing
+   *  this list changes the lock stamp, so existing installs re-sync once. */
+  pythonExtras?: string[]
+  /** Extras added ONLY when an NVIDIA GPU is detected (`nvidia-smi -L`), e.g.
+   *  Ground Crew's CuPy stack behind `gpu`. The probe is skipped entirely when
+   *  this is empty. Overridable per run with `<APPID>_GPU=0|1` or
+   *  `EnsureOptions.gpu`. A machine that gains a GPU later re-syncs, because the
+   *  effective extras are part of the lock stamp. */
+  gpuExtras?: string[]
 }
 
 let _config: ShellConfig | null = null
