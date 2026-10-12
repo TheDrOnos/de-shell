@@ -42,6 +42,7 @@
  *                           manylinux2014_x86_64 | manylinux2014_aarch64      REQUIRED
  *   --out <dir>             output dir                                        default: wheelhouse-<platform>
  *   --extra <name>          an optional-dependency extra to include (repeatable; or deShell.wheelhouseExtras)
+ *   --no-extras             none, even when deShell.wheelhouseExtras names some
  *   --python-version <v>    3.13 or 3.13.12; default <projectRoot>/.python-version
  *   --app-id, --version, --project-root, --electron-dir   as bundle-python.mjs
  *   --app-name <name>       display name for the zip file     default: deShell.productName, else appId
@@ -64,7 +65,7 @@ function parseFlags(argv) {
     const m = /^--([^=]+)(?:=(.*))?$/.exec(argv[i])
     if (!m) throw new Error(`unexpected argument ${argv[i]}`)
     const [, key, inline] = m
-    const val = inline !== undefined ? inline : (key === 'zip' ? true : argv[++i])
+    const val = inline !== undefined ? inline : (['zip', 'no-extras'].includes(key) ? true : argv[++i])
     if (key === 'extra') out.extra.push(val)
     else out[key] = val
   }
@@ -241,7 +242,11 @@ const platform = flags.platform
 if (!platform) throw new Error('--platform is required (e.g. win_amd64)')
 const target = describePlatform(platform)
 const projectRoot = resolve(electronDir, flags['project-root'] ?? cfg.projectRoot ?? '..')
-const extras = flags.extra.length ? flags.extra : (cfg.wheelhouseExtras ?? [])
+// --extra replaces deShell.wheelhouseExtras rather than adding to it; --no-extras
+// is the way to say "none" when the config names some (a CPU-only wheelhouse).
+if (flags['no-extras'] && flags.extra.length) throw new Error('--no-extras and --extra are mutually exclusive')
+const extras = flags['no-extras'] ? []
+  : flags.extra.length ? flags.extra : (cfg.wheelhouseExtras ?? [])
 const outDir = resolve(electronDir, flags.out ?? `wheelhouse-${platform}`)
 const appName = (flags['app-name'] ?? cfg.productName ?? appId).replace(/\s+/g, '-')
 
@@ -267,6 +272,18 @@ const exported = execFileSync('uv', exportArgs, { cwd: projectRoot, encoding: 'u
 const reqText = filterRequirements(exported, { ...target.env, extras,
   python_version: pyMinor, python_full_version: pyFull,
   implementation_name: 'cpython', platform_python_implementation: 'CPython' })
+// A git / path / URL requirement has no hash and no wheel to download, and pip
+// would fail on it with a message about hashing version-control repositories.
+// Say what is actually wrong: a wheelhouse can only carry index-published
+// packages, so such a source has to be released (or become a workspace member,
+// which bundle-python ships as a wheel) first.
+const unhashable = reqText.split(/\r?\n/)
+  .filter((l) => /^\s*[A-Za-z0-9._-]+(\[[^\]]*\])?\s*@\s*\S/.test(l) || /^\s*(-e\s|git\+|file:|\.{1,2}[\\/])/.test(l))
+if (unhashable.length) {
+  throw new Error('the lock has dependencies that are not on a package index, so they cannot go in a '
+    + `wheelhouse:\n  ${unhashable.map((l) => l.trim()).join('\n  ')}\n`
+    + 'Publish them, or make them workspace members, first.')
+}
 const reqFile = join(outDir, '..', `.${basename(outDir)}.requirements.txt`)
 writeFileSync(reqFile, reqText)
 

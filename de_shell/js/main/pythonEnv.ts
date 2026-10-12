@@ -32,7 +32,9 @@
  * rather than `uv sync`.
  *
  * No residue: every packaged uv call pins `UV_PYTHON_INSTALL_DIR` under
- * userData, so uv's managed interpreters do not land in %APPDATA%\uv\python.
+ * userData, so uv's managed interpreters do not land in %APPDATA%\uv\python,
+ * turns off uv's ~/.local/bin launchers and registry entries, and requires a
+ * managed interpreter so the env never links to a Python the app does not own.
  *
  * In development (no bundled payload) we fall back to `uv run` from the repo
  * root — exactly the previous behaviour.
@@ -552,6 +554,19 @@ function uvEnv(
     // cleans. Existing venvs keep working after this moves — their pyvenv.cfg
     // records the absolute path of the interpreter they were created with.
     UV_PYTHON_INSTALL_DIR: join(envDir, '..', 'python'),
+    // ...and nothing else of uv's leaks out either. `uv python install` (the
+    // offline path, and any automatic download) otherwise also drops a
+    // python3.X.exe launcher into ~/.local/bin and registers the interpreter
+    // under HKCU\Software\Python\Astral (PEP 514). Both outlive an uninstall
+    // and point into a folder it deletes.
+    UV_PYTHON_INSTALL_BIN: '0',
+    UV_PYTHON_INSTALL_REGISTRY: '0',
+    // Only ever build the env on an interpreter in that folder. Without it uv
+    // takes the first suitable Python it discovers -- one on PATH, or a
+    // launcher another tool left in ~/.local/bin -- and the venv's pyvenv.cfg
+    // then points at something this app neither owns nor removes, and which
+    // may vanish under it. Seen in testing: a venv linked to a stray launcher.
+    UV_MANAGED_PYTHON: '1',
     ...extraEnv,
   }
 }
