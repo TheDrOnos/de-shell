@@ -21,6 +21,35 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
  *  electron's types. */
 export interface FileFilter { name: string; extensions: string[] }
 
+/** Last-known updater state; mirrors @de/shell-main's UpdateStatus (the
+ *  renderer cannot import main, so the shape is restated here). */
+export type BridgeUpdateStatus =
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'available'; version: string; releaseNotes?: string }
+  | { state: 'not-available' }
+  | { state: 'downloading'; percent: number }
+  | { state: 'downloaded'; version: string }
+  | { state: 'error'; message: string }
+
+export interface BridgeUpdateInfo {
+  channel: 'stable' | 'beta'
+  /** False for dev / unpackaged runs, which have no app-update.yml. */
+  supported: boolean
+  status: BridgeUpdateStatus
+  appVersion: string
+}
+
+export interface BridgeReportResult {
+  sent: boolean
+  eventId?: string
+  bundlePath?: string
+  error?: string
+}
+
+/** What the renderer answers when first-run setup fails. */
+export type EnvSetupChoice = 'retry' | 'use-wheelhouse' | 'quit'
+
 export interface ShellBridgeOptions {
   /** Matches @de/shell-main's `appId` — channels are `<appId>:<name>`. */
   appId: string
@@ -112,6 +141,33 @@ export function createShellBridge(opts: ShellBridgeOptions) {
     saveFile: (filters?: FileFilter[], defaultPath?: string): Promise<string | null> =>
       ipcRenderer.invoke(channel('save-file'), filters, defaultPath),
 
+    /** Auto-update. Needs `registerUpdaterIpc()` in main. Status is pushed by
+     *  main's updater; `info()` seeds a UI that mounts after the first push. */
+    updater: {
+      info: (): Promise<BridgeUpdateInfo> => ipcRenderer.invoke(channel('update-info')),
+      check: () => ipcRenderer.send(channel('update-check')),
+      download: () => ipcRenderer.send(channel('update-download')),
+      quitAndInstall: () => ipcRenderer.send(channel('update-install')),
+      setChannel: (c: 'stable' | 'beta') => ipcRenderer.send(channel('update-set-channel'), c),
+      onStatus: (cb: (status: BridgeUpdateStatus) => void) =>
+        on<[BridgeUpdateStatus]>(channel('update-status'), cb),
+    },
+
+    /** Problem reporting. Needs `registerProblemReportIpc()` in main. */
+    report: {
+      diagnostics: (): Promise<{ canSend: boolean; diagnostics: Record<string, unknown> }> =>
+        ipcRenderer.invoke(channel('report-diagnostics')),
+      submit: (input: { message: string; contact?: string }): Promise<BridgeReportResult> =>
+        ipcRenderer.invoke(channel('report-submit'), input),
+    },
+
+    /** First-run environment setup. The progress/error messages themselves
+     *  arrive as `{type: 'env_setup'}` on `onMessage` (route them with
+     *  `toShellAction`); this is only the answer path back to `runEnvSetup`. */
+    envSetup: {
+      answer: (choice: EnvSetupChoice) => ipcRenderer.send(channel('env-setup-answer'), choice),
+    },
+
     /** Escape hatch for an app's own channels, so it does not have to
      *  re-implement the disposer discipline above. */
     onChannel: on,
@@ -128,3 +184,7 @@ export function exposeShellBridge(
     ...createShellBridge(opts), ...extra,
   })
 }
+
+/** The bridge's shape, so an app types `window.<appId>` from this instead of
+ *  hand-copying it (and drifting): `ShellBridge & { myOwnThing(): … }`. */
+export type ShellBridge = ReturnType<typeof createShellBridge>

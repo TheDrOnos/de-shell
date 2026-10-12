@@ -66,6 +66,11 @@ export interface EnvSetupState {
   percent: number | null
   /** Rolling raw output tail (bounded). */
   lines: string[]
+  /** Set when setup failed and is waiting on the user (retry / install from a
+   *  folder / quit). Null while running. */
+  error?: string | null
+  /** Folder being installed from, once the user picked one. */
+  wheelhouse?: string | null
 }
 
 export interface ShellState {
@@ -120,7 +125,8 @@ export type ShellAction =
   | { type: 'LOG_CLEAR' }
   | { type: 'LOG_LEVEL'; level: string }
   | { type: 'BACKEND_EXITED'; code: number | null; reason?: string }
-  | { type: 'ENV_SETUP_START' }
+  | { type: 'ENV_SETUP_START'; wheelhouse?: string | null }
+  | { type: 'ENV_SETUP_ERROR'; message: string; wheelhouse?: string | null }
   | { type: 'ENV_SETUP_PROGRESS'; phase?: EnvPhase; step?: string; percent: number | null; raw: string }
   | { type: 'ENV_SETUP_DONE' }
   | { type: 'WINDOW_COMPUTING'; windowId: number; computing: boolean }
@@ -191,6 +197,8 @@ export function shellReducer<S extends ShellState>(state: S, action: ShellAction
           step: 'Preparing the analysis environment',
           percent: null,
           lines: [],
+          error: null,
+          wheelhouse: action.wheelhouse ?? null,
         },
         status: 'Setting up the analysis environment…',
       }
@@ -204,7 +212,8 @@ export function shellReducer<S extends ShellState>(state: S, action: ShellAction
       }
       // Keep the last meaningful step/phase when a noisy line parses to nothing;
       // always append the raw line to the bounded tail so it visibly moves.
-      const lines = [...prev.lines, action.raw].slice(-200)
+      // A throttled batch from main carries several newline-joined lines.
+      const lines = [...prev.lines, ...action.raw.split('\n')].slice(-200)
       return {
         ...state,
         envSetup: {
@@ -213,6 +222,17 @@ export function shellReducer<S extends ShellState>(state: S, action: ShellAction
           percent: action.percent,
           lines,
         },
+      }
+    }
+
+    case 'ENV_SETUP_ERROR': {
+      const prev = state.envSetup ?? {
+        phase: 'working' as EnvPhase, step: 'Setting up', percent: null, lines: [],
+      }
+      return {
+        ...state,
+        envSetup: { ...prev, error: action.message, wheelhouse: action.wheelhouse ?? prev.wheelhouse ?? null },
+        status: 'Environment setup failed',
       }
     }
 
@@ -294,16 +314,27 @@ export function toShellAction(msg: Record<string, unknown>): ShellAction | null 
         windowId: Number(msg.window_id),
         computing: Boolean(msg.computing),
       }
-    case 'env_setup':
-      if (msg.event === 'start') return { type: 'ENV_SETUP_START' }
-      if (msg.event === 'done') return { type: 'ENV_SETUP_DONE' }
+    case 'env_setup': {
+      // `state` is what runEnvSetup sends; a bare string `event` is the older
+      // flat shape some apps still emit themselves.
+      const wheelhouse = (msg.wheelhouse ?? null) as string | null
+      const st = msg.state ?? (typeof msg.event === 'string' ? msg.event : 'progress')
+      if (st === 'start') return { type: 'ENV_SETUP_START', wheelhouse }
+      if (st === 'done') return { type: 'ENV_SETUP_DONE' }
+      if (st === 'error') {
+        return { type: 'ENV_SETUP_ERROR', message: String(msg.message ?? 'Setup failed'), wheelhouse }
+      }
+      const ev = (msg.event && typeof msg.event === 'object' ? msg.event : msg) as {
+        phase?: EnvPhase; step?: string; percent?: number | null
+      }
       return {
         type: 'ENV_SETUP_PROGRESS',
-        phase: msg.phase as EnvPhase | undefined,
-        step: msg.step as string | undefined,
-        percent: (msg.percent ?? null) as number | null,
-        raw: String(msg.raw ?? ''),
+        phase: ev.phase,
+        step: ev.step,
+        percent: ev.percent ?? null,
+        raw: String(msg.line ?? msg.raw ?? ''),
       }
+    }
     default:
       return null
   }

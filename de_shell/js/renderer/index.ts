@@ -27,8 +27,29 @@ export { asShellMessage } from './protocol'
 export type {
   MsgBase, ShellMessage,
   ReadyMessage, StatusMessage, ErrorMessage, ProgressMessage,
-  BackendExitedMessage, EnvSetupMessage,
+  BackendExitedMessage, EnvSetupMessage, EnvSetupEvent,
   FigureMessage, StateUpdateMessage, StateUpdateBinaryMessage,
   WindowClosedMessage, WindowTitleMessage, WindowComputingMessage,
   LogMessage, LogBackfillMessage, LogLevelMessage,
 } from './protocol'
+
+// First-run setup, auto-update and problem reporting: components over the
+// preload bridge's `envSetup` / `updater` / `report` (pass those as props), with
+// their decisions in pure *Model/*View modules.
+export { EnvSetupOverlay } from './EnvSetupOverlay'
+export type { EnvSetupOverlayProps } from './EnvSetupOverlay'
+export { UpdateCard } from './UpdateCard'
+export type { UpdateCardProps } from './UpdateCard'
+export { UpdateDialog } from './UpdateDialog'
+export type { UpdateDialogProps } from './UpdateDialog'
+export { ReportProblemDialog } from './ReportProblemDialog'
+export type { ReportProblemDialogProps } from './ReportProblemDialog'
+export { useUpdateStatus } from './useUpdateStatus.react'
+export type { UpdateSnapshot } from './useUpdateStatus.react'
+
+export { updateCardModel, updateDialogModel } from './updateModel'
+export type { UpdateStatus, UpdateAction, UpdateCardModel, UpdateDialogModel } from './updateModel'
+export { canSubmit, submitLabel, countProblems, outcomeModel } from './reportModel'
+export type { ReportPhase } from './reportModel'
+export { phasePills, stepText, logTail, ENV_PHASES } from './envSetupView'
+export type { UpdaterApi, ReportApi, EnvSetupApi, UpdateInfo, ReportResult } from './bridgeTypes'
