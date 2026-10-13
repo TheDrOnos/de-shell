@@ -171,7 +171,15 @@ export async function resolvePythonEnv(opts: EnsureOptions): Promise<ResolvedPyt
     } catch { /* a missing stamp just forces a re-sync next launch */ }
   }
 
-  return { cmd: [pythonExe, '-m', cfg.pythonModule], cwd: bundledProject }
+  // Run from the ENV, not the bundled project: a working directory is an open
+  // handle on that directory, and every process the sidecar spawns inherits it.
+  // Rooted in the install directory, that handle is what stops a Windows update
+  // from removing the old version — and the installer cannot even find the
+  // holder, because an app-running check scans for processes whose EXECUTABLE
+  // is under the install directory and this interpreter lives out here. Nothing
+  // wants the project directory: the app is installed into the env as a wheel,
+  // and what it reads from the bundle it reads by absolute path.
+  return { cmd: [pythonExe, '-m', cfg.pythonModule], cwd: envDir }
 }
 
 function readSafe(p: string): string {

@@ -7,16 +7,25 @@
  * an opaque `spawn uv ENOENT`. `findUv` resolves uv to an absolute path up
  * front: the PATH itself first, then the standard per-user install locations.
  *
- * Run: `node --test src/pythonEnv.test.ts` (from packages/shell-main/), or via
- * the `test:unit` npm script.
+ * The packaged branch has a second contract, and it is a Windows one: the
+ * sidecar must not RUN OUT OF the install directory. A working directory is an
+ * open handle that every process it spawns inherits, so a sidecar rooted there
+ * keeps the installer from removing the old version — while staying invisible
+ * to the app-running check, which can only match on executable path and finds
+ * this interpreter in the managed env instead. That dead-ended a Windows
+ * auto-update in "cannot be closed. Please close it manually and click Retry".
+ *
+ * Run: `node --test de_shell/js/main/pythonEnv.test.ts`, or via the `test:unit`
+ * npm script.
  */
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { tmpdir } from 'os'
+import { createHash } from 'crypto'
 import { configureShell } from './config.ts'
-import { findUv, resolvePythonEnv } from './pythonEnv.ts'
+import { findUv, resolvePythonEnv, venvPython } from './pythonEnv.ts'
 
 configureShell({
   appId: 'testapp',
@@ -134,4 +143,51 @@ test('dev-mode resolvePythonEnv leaves a bare uv when none is found (the spawn t
       else process.env[k] = v
     }
   }
+})
+
+/** A packaged layout whose managed env already matches the shipped lock, so
+ *  resolvePythonEnv() answers from disk without shelling out to uv. */
+function packagedLayout(): { resourcesPath: string; userData: string; envDir: string } {
+  const root = mkdtempSync(join(tmpdir(), 'packaged-'))
+  const resourcesPath = join(root, 'resources')
+  const userData = join(root, 'userData')
+  const projectDir = join(resourcesPath, 'python')
+  const envDir = join(userData, 'python-env')
+  const lock = 'version = 1\n'
+
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(join(projectDir, 'uv.lock'), lock)
+
+  const python = venvPython(envDir)
+  mkdirSync(dirname(python), { recursive: true })
+  writeFileSync(python, '')
+  writeFileSync(
+    join(envDir, '.testapp-lock-hash'),
+    createHash('sha256').update(Buffer.from(lock)).digest('hex'),
+  )
+  return { resourcesPath, userData, envDir }
+}
+
+test('packaged resolvePythonEnv does not run out of the install directory', async () => {
+  const { resourcesPath, userData } = packagedLayout()
+
+  const resolved = await resolvePythonEnv({
+    isPackaged: true, resourcesPath, projectRoot: '/unused', userData,
+  })
+
+  assert.ok(
+    !resolved.cwd.startsWith(resourcesPath),
+    `cwd ${resolved.cwd} is inside the install directory ${resourcesPath}`,
+  )
+})
+
+test('packaged resolvePythonEnv runs from the managed env with the env interpreter', async () => {
+  const { resourcesPath, userData, envDir } = packagedLayout()
+
+  const resolved = await resolvePythonEnv({
+    isPackaged: true, resourcesPath, projectRoot: '/unused', userData,
+  })
+
+  assert.equal(resolved.cwd, envDir)
+  assert.deepEqual(resolved.cmd, [venvPython(envDir), '-m', 'testapp'])
 })
