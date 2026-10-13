@@ -512,10 +512,10 @@ class FigureView:
                           linewidth: float = 2, show_handles: bool = True):
         """A draggable circle overlay. Returns the widget, or None.
 
-        WIDGETS, not raw pointer handlers, are the working way to get user
-        geometry out of an anyplotlib figure: the plot owns the hit-testing and
-        pushes the new state back, whereas a bare `pointer_down` never arrives
-        (the plot's own pan consumes it).
+        WIDGETS are the way to get DRAGGED geometry out of an anyplotlib
+        figure: the plot owns the hit-testing and pushes the new state back.
+        A plain click does arrive as `pointer_down` (anyplotlib >= 0.7.3
+        separates a click from a pan), so use `on_event` for click-to-mark.
 
         `on_change(cx, cy, r)` fires on ``pointer_up`` — when the drag settles —
         not on every frame, so a callback that recomputes something expensive
@@ -567,9 +567,9 @@ class FigureView:
 
         The measuring counterpart to the circle: drag either end onto a feature
         and the length between them is the measurement. A LINE widget rather
-        than two clicks because the same argument applies — the plot owns the
-        hit-testing and pushes the geometry back, whereas a bare `pointer_down`
-        never arrives (the plot's own pan consumes it).
+        than two clicks because the plot owns the hit-testing of a drag and
+        pushes the geometry back; clicks themselves do arrive as
+        `pointer_down` on anyplotlib >= 0.7.3.
 
         `on_change(x1, y1, x2, y2)` fires when a drag settles.
         """
