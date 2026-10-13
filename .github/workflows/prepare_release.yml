@@ -149,15 +149,15 @@ jobs:
           fi
 
       # ── Release pre-flight checks — fail HERE, not at release time ───────
-      # A drifted lock is the APPS' problem, not ours: they resolve the sidecar
-      # env from a lock on the user's machine, so it surfaces at their user's
-      # first launch rather than in any build of ours.
-      - name: Verify uv.lock is in sync with pyproject.toml
-        run: uv lock --check
-
+      # No `uv lock --check` here, though SpyDE's Prepare Release has one:
+      # de-shell is a LIBRARY and .gitignore keeps uv.lock out of the repo, so
+      # the check can only ever fail. The lock that matters to a user is the
+      # app's — SpyDE ships its own in the installer payload and resolves the
+      # sidecar env from it on the user's machine — and SpyDE already checks it.
+      #
       # Git deps must reference explicit SHAs or tags, never moving branches —
       # otherwise the same release resolves different code over time. There are
-      # none today; this keeps it that way.
+      # none today; this keeps it that way. Needs no lockfile.
       - name: Verify git dependencies are pinned to SHAs or tags
         run: |
           bad=$(grep -nE "git\+https" pyproject.toml | grep -vE '@[0-9a-f]{40}"|@v?[0-9]+(\.[0-9]+)+[^"]*"' || true)
@@ -242,7 +242,7 @@ jobs:
           ### What changed
           - \`de_shell/__init__.py\` bumped to \`${TAG#v}\` — the one place the version is
             written, and the value \`publish.yml\` refuses to let a tag disagree with
-          - Pre-flight checks passed: \`uv lock --check\`, git deps pinned to SHAs/tags
+          - Pre-flight checks passed: git dependencies pinned to SHAs or tags
           - \`CHANGELOG.rst\` assembled from the fragments in \`upcoming_changes/\`
 
           <details><summary><b>Release notes</b> (as they will appear in \`CHANGELOG.rst\`)</summary>
@@ -255,8 +255,12 @@ jobs:
           ### Review checklist
           - [ ] \`CHANGELOG.rst\` reads well — edit the assembled text directly if needed
           - [ ] Version is correct in \`de_shell/__init__.py\`
-          - [ ] CI passes. The wheel-contents leg is the one that matters most: it fails
-            if \`de_shell/js\` is missing, which is the whole point of the package.
+          - [ ] CI passes — but note it does NOT start on its own here: GitHub suppresses
+            workflow runs for events raised with \`GITHUB_TOKEN\`, so a PR opened by this
+            workflow gets no \`pull_request\` run. Close and reopen the PR, or push an
+            empty commit to it, to get one. The wheel-contents leg is the one that
+            matters most: it fails if \`de_shell/js\` is missing, which is the whole
+            point of the package.
 
           ### Manual check CI cannot cover
           CI never runs Electron — it typechecks the TypeScript and runs the node unit

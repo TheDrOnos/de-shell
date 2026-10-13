@@ -32,6 +32,7 @@ SHELL_MODULES = [
     "de_shell.debug_flags",
     "de_shell.compute",
     "de_shell.session",
+    "de_shell.remote_client",
 ]
 
 #: Absent from sys.modules after the imports above.

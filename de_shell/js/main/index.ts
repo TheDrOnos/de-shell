@@ -22,6 +22,10 @@ export {
 export { recordProblem, recordedProblems } from './problemLog'
 export type { Problem } from './problemLog'
 
+export { createRelay } from './relay'
+export type { Relay, RelayConnection, RelayCloseReason, RelayOptions } from './relay'
+export { encodeMessage, encodeBinary } from './framing'
+
 export {
   initErrorReporting, reportingConfigured, collectDiagnostics, submitReport,
 } from './errorReport'
