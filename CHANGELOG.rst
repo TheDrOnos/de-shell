@@ -12,6 +12,108 @@ change to the sidecar protocol bumps the minor.
 
 .. towncrier release notes start
 
+0.5.0b1 (2026-10-13)
+====================
+
+API and Behaviour Changes
+-------------------------
+
+- In packaged builds, the Python environment now uses only interpreters it
+  manages itself, and they live under ``<userData>/python``. An uninstall can
+  therefore remove everything the app downloaded.
+
+  * Every packaged uv call sets ``UV_PYTHON_INSTALL_DIR`` to ``<userData>/python``.
+    Previously uv used ``%APPDATA%\uv\python``, which no uninstaller owns.
+  * Every packaged uv call also sets ``UV_PYTHON_INSTALL_BIN=0`` and
+    ``UV_PYTHON_INSTALL_REGISTRY=0``. This stops uv leaving a ``python3.X``
+    launcher in ``~/.local/bin`` and a PEP 514 registry entry.
+  * Every packaged uv call sets ``UV_MANAGED_PYTHON=1``, so the env never links to
+    a Python found on ``PATH``.
+  * An existing environment keeps working until its next re-sync, which happens
+    when the lock or the extras change. That re-sync may rebuild it once on an
+    interpreter in the new location. (`#15 <https://github.com/directelectron/de-shell/pull/15>`_)
+
+
+New Features
+------------
+
+- The packaged first-run environment (``resolvePythonEnv``) can now install
+  optional extras and works offline.
+
+  * ``ShellConfig`` takes ``pythonExtras``, which are always installed, and
+    ``gpuExtras``. The GPU extras are added only when ``nvidia-smi`` finds a
+    device. An app or user can override the probe with ``EnsureOptions.gpu`` or
+    ``<APPID>_GPU=0|1``.
+  * The lock stamp now records the chosen extras. A machine that gains a GPU, or
+    an app that adds an extra, re-syncs. Installs with no extras keep the old
+    stamp and do not re-sync on upgrade.
+  * An **offline wheelhouse** installs with no network at all. It is a folder
+    holding ``wheelhouse.json``, every locked wheel and a python-build-standalone
+    mirror, built by ``packaging/build-wheelhouse.mjs``. The install is the
+    interpreter from the mirror, then a hash-checked ``uv pip install --offline
+    --no-index`` of the exported lock.
+  * The wheelhouse is looked for in ``EnsureOptions.wheelhouse``,
+    ``<APPID>_WHEELHOUSE``, ``<resources>/wheelhouse``, ``<userData>/wheelhouse``
+    and next to the executable.
+  * A probed GPU whose extras the wheelhouse lacks falls back to a CPU install.
+    It does not fail, and later launches remember the choice. A GPU the user
+    asked for explicitly still fails if its extras are missing.
+
+  The packaging pipeline that SpyDE ships with now lives in the shell, so apps no
+  longer keep their own copies. It is in ``de_shell/js/packaging/``, which
+  reaches an app as ``electron/shell/packaging/``:
+
+  * ``python -m de_shell.js link <electronDir> [--soft]`` makes the
+    ``electron/shell`` link. It replaces the ``scripts/shell-link.mjs`` each app
+    carried, and a generalised ``shell-link.mjs`` ships as well for apps that
+    want a node script. Unlike the old script, both refuse to replace a real
+    directory.
+  * ``bundle-python.mjs`` stages the ``<resources>/python`` payload: the lock,
+    the app and workspace-member wheels, a pinned ``uv``, and optionally MinGit.
+    It is configured by flags or a ``deShell`` block in ``electron/package.json``.
+  * ``build-wheelhouse.mjs`` builds the offline wheelhouse for one target
+    platform. It evaluates markers for the target rather than the build host, and
+    can optionally zip the result.
+  * ``installer.nsh`` replaces electron-builder's dead-end "cannot be closed"
+    check with a tree-kill of the app and of its sidecar, limited to this app's
+    own data. It also *offers* to remove the managed environment on uninstall.
+    The answer defaults to No, and is always No for silent and update runs.
+  * ``electron-builder.base.yml`` is a shared base config for an app to
+    ``extends``.
+  * ``.github/workflows/electron-release.yml`` is a reusable release workflow
+    (``workflow_call``). It handles stable/beta channels and the draft →
+    build-matrix → finalize sequence. It also attaches the Windows offline
+    wheelhouse zip, and signs with Azure Trusted Signing when the secrets are
+    present.
+
+  First-run setup, updates and problem reports can now each be wired with one
+  call.
+
+  * **Main process:**
+    * ``runEnvSetup(win, opts)`` wraps ``resolvePythonEnv``. It streams throttled
+      ``env_setup`` messages to the renderer. On failure it waits for the user
+      rather than rejecting: Retry, install from a folder (a wheelhouse) or Quit.
+    * ``registerUpdaterIpc()`` and ``registerProblemReportIpc()`` register the
+      namespaced channels over the existing updater and reporter.
+  * **Preload:** ``createShellBridge`` gains ``updater``, ``report`` and
+    ``envSetup``. ``ShellBridge`` is exported as a type, so apps no longer
+    restate the bridge's shape.
+  * **Renderer:** ``EnvSetupOverlay``, ``UpdateCard``, ``UpdateDialog``,
+    ``ReportProblemDialog`` and ``useUpdateStatus``. These are generalised from
+    SpyDE, with every string taken from props and colours from ``--shell-*``
+    CSS variables. ``shellReducer`` gains ``ENV_SETUP_ERROR`` and still accepts
+    the old ``env_setup`` message shape. (`#15 <https://github.com/directelectron/de-shell/pull/15>`_)
+
+
+Bug Fixes
+---------
+
+- The packaged sidecar runs from its Python environment rather than the install
+  directory, so a Windows update can remove the old version. Its working
+  directory used to hold the install directory open, and the update stalled at
+  "cannot be closed. Please close it manually and click Retry". (`#4 <https://github.com/directelectron/de-shell/pull/4>`_)
+
+
 0.4.0 (2026-09-26)
 ==================
 
