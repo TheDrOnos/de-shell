@@ -1,0 +1,109 @@
+# electron-builder.base.yml — the packaging config every de-shell app shares.
+# An app's own electron-builder.yml extends it and adds only what is its own:
+#
+#   extends: shell/packaging/electron-builder.base.yml
+#   appId: com.directelectron.groundcrew
+#   productName: Ground Crew
+#   publish: { provider: github, owner: directelectron, repo: de_ground_crew }
+#   mac:   { icon: ../assets/icon.png }      # see "icons" below
+#   win:   { icon: ../assets/icon.png }
+#   linux: { icon: ../assets/icon.png }
+#
+# HOW PATHS RESOLVE. `shell/` is the link `python -m de_shell.js link electron`
+# makes to the installed de_shell/js, so `shell/packaging/…` is this folder.
+# electron-builder resolves `extends` against the extending file's directory,
+# and every path INSIDE the merged config (directories, extraResources `from`,
+# nsis.include, icons) against the PROJECT directory -- the app's electron/ --
+# not against this file. That is why every path below is written relative to
+# electron/ and goes through `shell/`, and why none of them break when this
+# file is read from site-packages through the link. (The one thing the link
+# must not be is missing: the release workflow and the vite config both create
+# it before electron-builder runs.)
+#
+# The installer is small on purpose: it ships uv, the app's wheels and the lock
+# as extraResources (staged by bundle-python.mjs); the venv is built on first
+# launch into the user's data dir, or from an offline wheelhouse
+# (build-wheelhouse.mjs) on a machine with no network.
+
+copyright: © Direct Electron
+
+directories:
+  output: dist
+  buildResources: build
+
+# The compiled app (electron-vite output) + package manifest. node_modules are
+# pulled in automatically by electron-builder for production deps. `shell/` is
+# deliberately NOT listed: the TypeScript is compiled into out/ by the bundler,
+# and a junction into site-packages must never be walked by the packager.
+files:
+  - out/**/*
+  - package.json
+  - "!**/*.map"
+
+# The Python sidecar payload -- staged by bundle-python.mjs BEFORE the build.
+# Lands at <app resources>/python at runtime, which is where pythonEnv.ts reads
+# it. (An app that stages elsewhere with --out must repeat this block.)
+extraResources:
+  - from: resources/python
+    to: python
+    filter: ["**/*"]
+
+# Icons: ONE source image per app (a 512x512+ RGBA PNG), set per platform in the
+# app's own config -- electron-builder generates the .icns and .ico from it at
+# build time, so there is no hand-maintained icon set to drift. The icon paths
+# are the app's, so they are not defaulted here.
+mac:
+  category: public.app-category.education
+  # BOTH dmg (what users download by hand) AND zip. electron-updater CANNOT
+  # auto-update from a .dmg on macOS: it needs a .zip in latest-mac.yml. A
+  # dmg-only feed makes the updater download a dmg it cannot install.
+  target: [dmg, zip]
+  # Hardened runtime + entitlements are REQUIRED for notarization. The app owns
+  # build/entitlements.mac.plist; its sidecar loads third-party native wheels
+  # signed by other teams, so it needs com.apple.security.cs.disable-library-validation.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Notarize with the App Store Connect API key env (APPLE_API_KEY[_ID]/
+  # APPLE_API_ISSUER/APPLE_TEAM_ID). NB: NO `identity: null` -- that would
+  # DISABLE signing. With no signing env (a local build, a fork) electron-builder
+  # logs "skipped macOS code signing" and produces an unsigned build instead of
+  # failing, so only CI with the certificate imported actually signs.
+  notarize: true
+
+# Windows signing is NOT configured here: it is opt-in per build. The release
+# workflow passes -c.win.azureSignOptions.* (Azure Trusted Signing) only when
+# the Azure secrets exist, so an unsigned local build never trips over it.
+win:
+  target: [nsis]
+
+# Per-user NSIS installer: no admin, Start-Menu + desktop shortcuts, uninstaller,
+# user-chosen install dir.
+#
+# installer.nsh replaces the stock "is the app still running?" check, whose
+# single-process kill and instant re-check dead-ended a Windows auto-update in
+# "<App> cannot be closed. Please close it manually and click Retry", and adds
+# the offer to remove the managed Python environment on uninstall. Read it
+# before changing anything about how the app shuts down.
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  include: shell/packaging/installer.nsh
+
+linux:
+  target: [AppImage]
+  category: Science
+
+# Where release artifacts live (GitHub Releases); electron-builder also emits
+# the update-feed metadata (latest.yml / latest-mac.yml / latest-linux.yml)
+# electron-updater reads at runtime. This block alone publishes nothing: only
+# `--publish always` (the release workflow) does. owner/repo are the app's to
+# set for a LOCAL build's app-update.yml; the release workflow overrides both
+# (-c.publish.owner/.repo) with the repository it runs in, so publishing
+# survives a repo transfer with no edits.
+publish:
+  provider: github

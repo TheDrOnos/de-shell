@@ -52,12 +52,32 @@ export interface BackendExitedMessage extends MsgBase {
   reason?: string
 }
 
-/** First-run Python environment setup, parsed from `uv` output by the main
- *  process (envProgress.ts). `start`/`done` bracket the run. */
+/** A classified `uv` line (main's EnvProgressEvent, restated). */
+export interface EnvSetupEvent {
+  phase: 'resolving' | 'downloading' | 'installing' | 'building' | 'torch' | 'working'
+  step: string
+  percent: number | null
+}
+
+/** First-run Python environment setup, sent by main's `runEnvSetup`.
+ *  `start`/`done` bracket a run; `error` means it failed and main is waiting
+ *  for the user's answer (retry / folder / quit) — a `start` follows a retry.
+ *
+ *  The flat `event: 'start' | …` / `phase` / `step` / `raw` shape that apps used
+ *  to emit themselves is still accepted by `toShellAction`. */
 export interface EnvSetupMessage extends MsgBase {
   type: 'env_setup'
-  event: 'start' | 'progress' | 'done'
-  phase?: 'resolving' | 'downloading' | 'installing' | 'building' | 'torch' | 'working'
+  state?: 'start' | 'progress' | 'done' | 'error'
+  /** Classified event (new shape), or the legacy state string. */
+  event?: EnvSetupEvent | 'start' | 'progress' | 'done'
+  /** Raw uv output of this batch, newline-joined. */
+  line?: string
+  /** Failure text (state 'error'). */
+  message?: string
+  /** Folder being installed from, when the user picked one. */
+  wheelhouse?: string
+  /** Legacy flat fields. */
+  phase?: EnvSetupEvent['phase']
   step?: string
   percent?: number | null
   raw?: string

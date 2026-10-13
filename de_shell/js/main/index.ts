@@ -42,9 +42,12 @@ export type { BackendHandlers } from './backendProcess'
 
 export {
   resolvePythonEnv, managedEnvPaths, venvPython, readLockedTorchVersion,
-  installTorchPerMachine,
+  installTorchPerMachine, hasNvidiaGpu, readWheelhouse, findWheelhouse,
+  wheelhouseCandidates, lockStamp, buildSyncArgs, offlinePlan,
 } from './pythonEnv'
-export type { ResolvedPython, EnsureOptions } from './pythonEnv'
+export type {
+  ResolvedPython, EnsureOptions, WheelhouseManifest, CommandRunner, OfflinePlan,
+} from './pythonEnv'
 
 export { parseUvLine } from './envProgress'
 export type { EnvPhase, EnvProgressEvent } from './envProgress'
@@ -59,3 +62,8 @@ export type { UpdateChannel, UpdateStatus } from './updater'
 export {
   isPrereleaseVersion, defaultChannelForVersion, truncateMessage,
 } from './updaterErrors'
+
+export { registerUpdaterIpc, registerProblemReportIpc } from './shellIpc'
+
+export { runEnvSetup, EnvSetupQuitError } from './envSetup'
+export type { EnvSetupAnswer, EnvSetupWireMessage } from './envSetup'

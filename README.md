@@ -63,13 +63,23 @@ it into the project at a fixed path, then alias and `paths` through the link:
 python -m de_shell.js        # prints …/de_shell/js
 ```
 
-Autopilot's `electron/scripts/shell-link.mjs` is the reference: it makes
-`electron/shell` a junction (a symlink off Windows) to that folder, runs from
-npm's postinstall and from the vite config on every build, and re-points a
-stale link rather than trusting it. With it in place:
+The shell makes the link itself:
+
+```
+uv run python -m de_shell.js link electron          # electron/shell -> …/de_shell/js
+```
+
+That makes `electron/shell` a junction (a symlink off Windows) to that
+folder. It re-points a stale link rather than trusting it, and refuses to
+replace a real directory; `--soft` turns the refusal into a warning, which is
+what npm's postinstall wants. The same logic ships as
+`shell/packaging/shell-link.mjs` for the vite config to call on every build,
+once the first link exists. The copies the apps carried as
+`electron/scripts/shell-link.mjs` can go. With the link in place:
 
 ```ts
 // electron.vite.config.ts
+import { ensureShellLink } from './shell/packaging/shell-link.mjs'
 const shell = ensureShellLink(__dirname)
 resolve: { alias: { '@de/shell-main': resolve(shell, 'main', 'index.ts') },
            dedupe: ['react', 'react-dom'] }
@@ -91,6 +101,92 @@ All three apps are wired this way: Autopilot, SpyDE
 ([directelectron/spyde#152](https://github.com/directelectron/spyde/pull/152))
 and Ground Crew ([directelectron/de_ground_crew#183](https://github.com/directelectron/de_ground_crew/pull/183)),
 pinned to the `0.2` line.
+
+## Shipping an app
+
+An app ships as a per-user NSIS installer (an AppImage on Linux, a dmg on
+macOS). The installer is about 150 MB because the Python environment is **not**
+inside it. On first launch the shell builds the environment into `userData`,
+and an update re-syncs it only when the lock changed. Everything the pipeline
+needs lives in `shell/packaging/`.
+
+**The app provides:**
+
+* **A `deShell` block in `electron/package.json`.** This is read by
+  `bundle-python.mjs` and `build-wheelhouse.mjs`:
+
+  ```json
+  "deShell": { "appId": "groundcrew", "pythonDist": "de-ground-crew",
+               "pythonVersion": "3.13", "wheelhouseExtras": ["gpu"] }
+  ```
+
+* **`electron/electron-builder.yml`.** It extends the shell's base and adds
+  only what is the app's own:
+
+  ```yaml
+  extends: shell/packaging/electron-builder.base.yml
+  appId: com.directelectron.groundcrew
+  productName: Ground Crew
+  publish: { provider: github, owner: directelectron, repo: de_ground_crew }
+  ```
+
+* **`.github/workflows/release.yml`.** It calls the shared pipeline on a tag.
+  The pipeline runs in the app's repo and publishes to the app's releases:
+
+  ```yaml
+  on: { push: { tags: ["v*"] } }
+  jobs:
+    release:
+      permissions: { contents: write }
+      uses: directelectron/de-shell/.github/workflows/electron-release.yml@v0.5.0
+      with: { app-name: Ground Crew, wheelhouse-extras: gpu }
+      secrets: inherit
+  ```
+
+  The workflow links the shell with `uv run --frozen --no-dev`, so it syncs the
+  app's locked environment on the runner. It also attaches a
+  `<App>-<ver>-wheels-win_amd64.zip` offline wheelhouse to the release, and
+  signs Windows builds with Azure Trusted Signing when the `AZURE_*` secrets
+  and the `azure-*` inputs are set.
+
+* **Main-process wiring:**
+
+  ```ts
+  configureShell({ appId: 'groundcrew', appName: 'Ground Crew',
+                   pythonModule: 'de_groundcrew', pythonDist: 'de-ground-crew',
+                   gpuExtras: ['gpu'] })
+  registerShellDialogs(); registerUpdaterIpc(); registerProblemReportIpc()
+  const py = app.isPackaged
+    ? await runEnvSetup(win, { isPackaged: true, resourcesPath: process.resourcesPath,
+                               projectRoot, userData: app.getPath('userData') })
+    : await resolvePythonEnv({ isPackaged: false, resourcesPath: '', projectRoot, userData: '' })
+  ```
+
+  The renderer shows `EnvSetupOverlay` while `state.envSetup` is set, and
+  `UpdateCard`/`UpdateDialog` and `ReportProblemDialog` where the app wants
+  them.
+
+**Extras and the GPU.** `pythonExtras` are always installed. `gpuExtras` are
+installed when `nvidia-smi` finds a device. `<APPID>_GPU=0|1` overrides the
+probe either way.
+
+**Offline sites.** Unzip the release's wheelhouse into the install
+folder (next to the app's `.exe`) or into `userData/wheelhouse`, or let the
+user choose it with "Install from a folder…" when the online install fails. The first launch then installs with no network:
+
+* the interpreter comes from the wheelhouse's python-build-standalone mirror;
+* the packages are the exported lock, installed with `uv pip install --offline
+  --no-index --require-hashes`.
+
+A frozen `uv sync --offline --find-links` cannot do this, because uv looks for
+registry-locked wheels only in its cache. A GPU machine given a wheelhouse
+built without the GPU extra installs CPU-only and remembers that. It does not
+fail.
+
+**No residue.** The env, the uv cache and uv's managed interpreters all live
+under `userData`. The uninstaller offers to remove them. The answer defaults to
+No, and is always No for silent runs and updates, so an update never
+re-downloads the environment.
 
 ## Developing it
 
