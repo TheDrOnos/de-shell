@@ -1,0 +1,4 @@
+The packaged sidecar runs from its Python environment rather than the install
+directory, so a Windows update can remove the old version. Its working
+directory used to hold the install directory open, and the update stalled at
+"cannot be closed. Please close it manually and click Retry".

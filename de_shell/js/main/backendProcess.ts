@@ -63,7 +63,8 @@ export function startBackend(
   stopping = false  // fresh process — allow a future stopBackend() to run
   const [cmd, ...args] = pythonCmd
   const child = spawn(cmd, args, {
-    cwd,   // run from the project root so `uv run` finds the app's pyproject.toml
+    cwd,   // dev: the repo root, so `uv run` finds the app's pyproject.toml.
+           // Packaged: the managed env — never the install dir (see pythonEnv).
     // APL_BINARY_TRANSPORT=1: anyplotlib ships large image pixels as raw PLOTBIN
     // binary frames (no base64/JSON) which this runner demuxes — see the stdout
     // parser below. Verified end-to-end (pixel-correct via GPU readback); cuts the
