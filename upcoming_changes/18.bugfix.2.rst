@@ -1,2 +1,0 @@
-A packaged app whose Python environment folder was left half-deleted now rebuilds it on the
-next launch, instead of failing at environment setup every time.

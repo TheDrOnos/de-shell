@@ -12,6 +12,20 @@ change to the sidecar protocol bumps the minor.
 
 .. towncrier release notes start
 
+0.5.0b2 (2026-10-14)
+====================
+
+Bug Fixes
+---------
+
+- A packaged app whose Python environment folder was left half-deleted now rebuilds it on the
+  next launch, instead of failing at environment setup every time. (`#18 <https://github.com/directelectron/de-shell/pull/18>`_)
+- The uninstaller now finds an app's Python environment when ``productName`` is set only in
+  ``electron-builder.yml``. Before this it never offered to remove it, and the install sweep
+  could miss a stray backend. Answering Yes now removes files with paths longer than 260
+  characters too. (`#18 <https://github.com/directelectron/de-shell/pull/18>`_)
+
+
 0.5.0b1 (2026-10-13)
 ====================
 
