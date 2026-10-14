@@ -40,7 +40,7 @@
  * root — exactly the previous behaviour.
  */
 import { spawn } from 'child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { createHash } from 'crypto'
 import { dirname, join } from 'path'
 // Extension spelled out so node:test can load this module without a bundler
@@ -468,6 +468,9 @@ export async function resolvePythonEnv(opts: EnsureOptions): Promise<ResolvedPyt
       }
       checkWheelhouseExtras(extras, found.manifest)
     }
+    if (clearBrokenEnv(envDir)) {
+      opts.onProgress?.('[env-setup] removed an incomplete Python environment left by an earlier install\n')
+    }
     await setupEnv({
       projectDir: bundledProject, envDir, appVersion: readAppVersion(bundledProject),
       extras, wheelhouse: found, onProgress: opts.onProgress,
@@ -487,6 +490,21 @@ export async function resolvePythonEnv(opts: EnsureOptions): Promise<ResolvedPyt
   // wants the project directory: the app is installed into the env as a wheel,
   // and what it reads from the bundle it reads by absolute path.
   return { cmd: [pythonExe, '-m', cfg.pythonModule], cwd: envDir }
+}
+
+/**
+ * Remove `envDir` if it exists but is not a virtual environment (no
+ * pyvenv.cfg). uv refuses such a directory outright ("cannot be used because it
+ * is not a valid Python environment"), so without this a half-removed env — an
+ * uninstall that could not delete every file, or a crash mid-delete — would
+ * stop the app at env setup on every launch until someone deleted it by hand.
+ * The directory is the shell's own, so nothing else lives in it. Returns
+ * whether it removed anything.
+ */
+export function clearBrokenEnv(envDir: string): boolean {
+  if (!existsSync(envDir) || existsSync(join(envDir, 'pyvenv.cfg'))) return false
+  rmSync(envDir, { recursive: true, force: true, maxRetries: 3 })
+  return true
 }
 
 function readSafe(p: string): string {
