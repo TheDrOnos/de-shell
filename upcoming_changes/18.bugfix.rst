@@ -1,4 +1,0 @@
-The uninstaller now finds an app's Python environment when ``productName`` is set only in
-``electron-builder.yml``. Before this it never offered to remove it, and the install sweep
-could miss a stray backend. Answering Yes now removes files with paths longer than 260
-characters too.
