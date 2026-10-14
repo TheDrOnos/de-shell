@@ -1,7 +1,15 @@
 ; installer.nsh — the shell's NSIS customisations, shared by every de-shell app.
 ; electron-builder includes it through `nsis.include` (electron-builder.base.yml
 ; sets it); nothing in here names an app: the product comes from the defines
-; electron-builder generates (PRODUCT_NAME, APP_FILENAME, APP_EXECUTABLE_FILENAME).
+; electron-builder generates (PRODUCT_NAME, APP_PACKAGE_NAME, APP_EXECUTABLE_FILENAME).
+;
+; WHERE IS userData? Electron puts it at %APPDATA%\<app.name>, and app.name is
+; package.json's productName when it has one, else its name. An app can set
+; productName in electron-builder.yml instead, where Electron never sees it:
+; Ground Crew's userData is %APPDATA%\de-groundcrew while its product name (and
+; APP_FILENAME, its install folder) is "Ground Crew". So both names are checked:
+; ${APP_PACKAGE_NAME} (the package.json name) and ${PRODUCT_NAME}. Both belong
+; to this app, so neither can reach a sibling app's data.
 ;
 ; Two things live here:
 ;
@@ -47,7 +55,8 @@
 ;     there), and why the sidecar no longer runs from the install dir at all
 ;     (de-shell's pythonEnv.ts).
 ;
-; The userData sweep is keyed on $APPDATA\${APP_FILENAME}\ and nothing broader.
+; The userData sweep is keyed on this app's own userData (either name, see the
+; top of the file) and nothing broader.
 ; Two de-shell apps are routinely installed side by side; updating one must not
 ; kill the other's sidecar.
 ;
@@ -90,12 +99,12 @@ Var deShellSetupPid
     ; install directory, kill each one's whole tree, wait". Exits 0 the moment
     ; nothing is left, 1 if the directory is still busy after ~6 s. Two things
     ; count as holding it: a process running out of $INSTDIR, and one running
-    ; out of THIS app's managed Python (python-env\ or python\ under
-    ; $APPDATA\${APP_FILENAME}\), which is the sidecar -- see the header.
+    ; out of THIS app's managed Python (python-env\ or python\ under either
+    ; userData name), which is the sidecar -- see the header.
     ; The trailing backslash on each directory keeps a sibling install (...\App
     ; vs ...\App-old) from matching. `$$` is NSIS's escape for a literal `$`,
     ; so `$$_` reaches PowerShell as `$_`.
-    nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "$$dir='$INSTDIR\'; $$data='$APPDATA\${APP_FILENAME}\'; $$self=$deShellSetupPid; for($$round=0; $$round -lt 12; $$round++){ $$busy=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $$p=$$_.Path; $$p -and $$_.ProcessId -ne $$self -and ($$p.StartsWith($$dir,'CurrentCultureIgnoreCase') -or ($$p.StartsWith($$data,'CurrentCultureIgnoreCase') -and ($$p -like '*\python-env\*' -or $$p -like '*\python\*'))) }); if($$busy.Count -eq 0){ exit 0 }; foreach($$victim in $$busy){ $$null = & taskkill.exe /PID $$victim.ProcessId /T /F 2>&1 }; Start-Sleep -Milliseconds 500 }; exit 1"`
+    nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "$$dir='$INSTDIR\'; $$data=@('$APPDATA\${APP_PACKAGE_NAME}\','$APPDATA\${PRODUCT_NAME}\'); $$self=$deShellSetupPid; for($$round=0; $$round -lt 12; $$round++){ $$busy=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $$p=$$_.Path; $$mine=$$false; if($$p -and ($$p -like '*\python-env\*' -or $$p -like '*\python\*')){ foreach($$d in $$data){ if($$p.StartsWith($$d,'CurrentCultureIgnoreCase')){ $$mine=$$true } } }; $$p -and $$_.ProcessId -ne $$self -and ($$p.StartsWith($$dir,'CurrentCultureIgnoreCase') -or $$mine) }); if($$busy.Count -eq 0){ exit 0 }; foreach($$victim in $$busy){ $$null = & taskkill.exe /PID $$victim.ProcessId /T /F 2>&1 }; Start-Sleep -Milliseconds 500 }; exit 1"`
     Pop $R0
 
     ; nsExec pushes "error" when the program could not be started at all -- a
@@ -141,7 +150,8 @@ Var deShellSetupPid
 ; ───────────────────────────────────────────────────────────────────────────
 ;
 ; Everything the app creates OUTSIDE the install directory sits in its userData
-; ($APPDATA\${APP_FILENAME}, Electron's app.getPath('userData')), and is what
+; (Electron's app.getPath('userData'): $APPDATA\${APP_PACKAGE_NAME} or
+; $APPDATA\${PRODUCT_NAME}, see the top of the file), and is what
 ; de-shell's pythonEnv.ts put there:
 ;
 ;   python-env\                 the venv (can be many GB: scientific wheels)
@@ -166,17 +176,30 @@ Var deShellSetupPid
 ; Strings are English-only; the stock installer strings are localised by
 ; electron-builder, ours are not.
 ;
-; Which directory? Electron names userData after app.name -- the productName
-; when package.json has one -- while electron-builder derives APP_FILENAME from
-; the same productName (sanitised). They agree in every de-shell app; if an app
-; ever sets `nsis.shortcutName` or `electronBuilder` names that make them
-; differ, ${APP_FILENAME} is what to change here.
+; One question covers both userData names; a Yes clears the items from both.
+; Removing what is not there is a no-op.
 
-!macro deShellRemoveUserDataItem name
-  ; RMDir /r on a path that is a file does nothing, and Delete on a directory
-  ; does nothing, so one macro covers both without testing which it is.
-  RMDir /r "$APPDATA\${APP_FILENAME}\${name}"
-  Delete "$APPDATA\${APP_FILENAME}\${name}"
+!macro deShellRemoveUserDataItem base name
+  ; NSIS's RMDir cannot delete a path longer than MAX_PATH (260), and a Python
+  ; env has them: jupyterlab-widgets' labextension files run to 330 characters
+  ; under %APPDATA%. `rd` with the \\?\ prefix has no such limit, so it goes
+  ; first; RMDir then catches anything rd left. RMDir /r and rd on a path that
+  ; is a file do nothing, and Delete on a directory does nothing, so one macro
+  ; covers both without testing which it is.
+  Push $0
+  nsExec::Exec `"$SYSDIR\cmd.exe" /C rd /s /q "\\?\$APPDATA\${base}\${name}"`
+  Pop $0   ; rd's exit code: not needed, RMDir below is the check
+  Pop $0   ; the caller's $0
+  RMDir /r "$APPDATA\${base}\${name}"
+  Delete "$APPDATA\${base}\${name}"
+!macroend
+
+!macro deShellRemoveEnvFrom base
+  !insertmacro deShellRemoveUserDataItem "${base}" "python-env"
+  !insertmacro deShellRemoveUserDataItem "${base}" "uv-cache"
+  !insertmacro deShellRemoveUserDataItem "${base}" "python"
+  !insertmacro deShellRemoveUserDataItem "${base}" "requirements.offline.txt"
+  !insertmacro deShellRemoveUserDataItem "${base}" "wheelhouse"
 !macroend
 
 !macro customUnInstall
@@ -184,19 +207,20 @@ Var deShellSetupPid
   ; is the shared ProgramData -- not where Electron put userData.
   SetShellVarContext current
 
-  ${if} ${FileExists} "$APPDATA\${APP_FILENAME}\python-env\*.*"
-  ${orIf} ${FileExists} "$APPDATA\${APP_FILENAME}\uv-cache\*.*"
-  ${orIf} ${FileExists} "$APPDATA\${APP_FILENAME}\python\*.*"
-  ${orIf} ${FileExists} "$APPDATA\${APP_FILENAME}\wheelhouse\*.*"
+  ${if} ${FileExists} "$APPDATA\${APP_PACKAGE_NAME}\python-env\*.*"
+  ${orIf} ${FileExists} "$APPDATA\${APP_PACKAGE_NAME}\uv-cache\*.*"
+  ${orIf} ${FileExists} "$APPDATA\${APP_PACKAGE_NAME}\python\*.*"
+  ${orIf} ${FileExists} "$APPDATA\${APP_PACKAGE_NAME}\wheelhouse\*.*"
+  ${orIf} ${FileExists} "$APPDATA\${PRODUCT_NAME}\python-env\*.*"
+  ${orIf} ${FileExists} "$APPDATA\${PRODUCT_NAME}\uv-cache\*.*"
+  ${orIf} ${FileExists} "$APPDATA\${PRODUCT_NAME}\python\*.*"
+  ${orIf} ${FileExists} "$APPDATA\${PRODUCT_NAME}\wheelhouse\*.*"
     MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 \
       "Also remove ${PRODUCT_NAME}'s Python environment, package cache and downloaded Python?$\r$\n$\r$\nThis frees the disk space they use. Your settings and logs are kept.$\r$\n$\r$\nChoose No if you are only reinstalling or updating ${PRODUCT_NAME}." \
       /SD IDNO IDNO deShellKeepData
     DetailPrint "Removing ${PRODUCT_NAME}'s Python environment..."
-    !insertmacro deShellRemoveUserDataItem "python-env"
-    !insertmacro deShellRemoveUserDataItem "uv-cache"
-    !insertmacro deShellRemoveUserDataItem "python"
-    !insertmacro deShellRemoveUserDataItem "requirements.offline.txt"
-    !insertmacro deShellRemoveUserDataItem "wheelhouse"
+    !insertmacro deShellRemoveEnvFrom "${APP_PACKAGE_NAME}"
+    !insertmacro deShellRemoveEnvFrom "${PRODUCT_NAME}"
   ${endif}
   deShellKeepData:
 

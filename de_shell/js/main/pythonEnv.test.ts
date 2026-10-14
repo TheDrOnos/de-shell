@@ -20,7 +20,7 @@
  */
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs'
+import { existsSync, mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs'
 import { dirname, join } from 'path'
 import { tmpdir } from 'os'
 import { createHash } from 'crypto'
@@ -28,7 +28,7 @@ import { configureShell } from './config.ts'
 import {
   findUv, resolvePythonEnv, hasNvidiaGpu, readWheelhouse, findWheelhouse,
   wheelhouseCandidates, lockStamp, buildSyncArgs, offlinePlan, effectiveExtras,
-  gpuEnvOverride, platformMatches, fileUrl, checkWheelhouseExtras, venvPython,
+  gpuEnvOverride, platformMatches, fileUrl, checkWheelhouseExtras, venvPython, clearBrokenEnv,
 } from './pythonEnv.ts'
 
 configureShell({
@@ -336,4 +336,26 @@ test('packaged resolvePythonEnv runs from the managed env with the env interpret
 
   assert.equal(resolved.cwd, envDir)
   assert.deepEqual(resolved.cmd, [venvPython(envDir), '-m', 'testapp'])
+})
+
+// ── a half-removed env ───────────────────────────────────────────────────────
+
+test('clearBrokenEnv removes an env dir with no pyvenv.cfg, past MAX_PATH', () => {
+  // What an uninstall that could not delete long paths leaves behind: uv
+  // refuses the directory, so first launch would fail until it is gone.
+  const envDir = join(tempDir('broken-env-'), 'python-env')
+  const deep = join(envDir, 'share', 'jupyter', 'labextensions', 'x'.repeat(120), 'y'.repeat(120))
+  mkdirSync(deep, { recursive: true })
+  writeFileSync(join(deep, 'z'.repeat(60) + '.js.map'), '')
+  assert.equal(clearBrokenEnv(envDir), true)
+  assert.equal(existsSync(envDir), false)
+})
+
+test('clearBrokenEnv keeps a real venv and ignores a missing dir', () => {
+  const envDir = join(tempDir('venv-'), 'python-env')
+  mkdirSync(envDir, { recursive: true })
+  writeFileSync(join(envDir, 'pyvenv.cfg'), 'home = x\n')
+  assert.equal(clearBrokenEnv(envDir), false)
+  assert.equal(existsSync(join(envDir, 'pyvenv.cfg')), true)
+  assert.equal(clearBrokenEnv(join(tempDir('none-'), 'python-env')), false)
 })
