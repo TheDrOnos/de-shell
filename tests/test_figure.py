@@ -237,3 +237,27 @@ class TestReadout:
     def test_every_figure_frame_relays_its_readout_to_the_host(self):
         head = fill_iframe_html("<head></head><body></body>").split("<body>")[0]
         assert "apl:readout" in head and "apl_readout" in head
+
+
+class TestColormaps:
+    def test_every_name_is_its_own_table(self):
+        # A misspelled name falls back to the grey ramp without an error, and
+        # some names are aliases of others; either way the picker would offer
+        # two entries that draw the same picture.
+        from anyplotlib._utils import _build_colormap_lut
+
+        from de_shell.plotting.colormaps import COLORMAPS
+
+        tables = {name: bytes(np.asarray(_build_colormap_lut(name), np.uint8)) for name in COLORMAPS}
+        assert len(set(tables.values())) == len(tables)
+
+    def test_the_diverging_map_is_white_in_the_middle(self):
+        from anyplotlib._utils import _build_colormap_lut
+
+        from de_shell.plotting.colormaps import COLORMAPS, DIVERGING_COLORMAP
+
+        assert DIVERGING_COLORMAP in COLORMAPS
+        table = np.asarray(_build_colormap_lut(DIVERGING_COLORMAP), float)
+        low, middle, high = table[0], table[len(table) // 2], table[-1]
+        assert middle.min() > 220, "zero should read as white"
+        assert low[2] > low[0] and high[0] > high[2], "blue below zero, red above"
