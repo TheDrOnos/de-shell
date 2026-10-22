@@ -21,7 +21,11 @@ COLORMAPS: dict[str, str] = {
     "magma": "magma",
     "cividis": "cividis",
     "turbo": "turbo",
-    "CET_R1": "CET_R1",   # diverging
+    "CET_R1": "CET_R1",   # a rainbow, not a diverging map: its middle is yellow
+    "CET_D1": "CET_D1",   # diverging blue-white-red, matplotlib's coolwarm
 }
 
 DEFAULT_COLORMAP = "gray"
+#: For a signed map (a strain, a field component): white at the middle, so a
+#: range centered on zero shows zero as white.
+DIVERGING_COLORMAP = "CET_D1"
