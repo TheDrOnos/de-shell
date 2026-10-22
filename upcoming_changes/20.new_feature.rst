@@ -1,0 +1,1 @@
+The colormap picker offers ``CET_D1``, a diverging blue-white-red map (matplotlib's ``coolwarm``), and ``DIVERGING_COLORMAP`` names it for signed images. ``CET_R1``, which was listed as the diverging map, is a rainbow.
