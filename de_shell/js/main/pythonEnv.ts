@@ -625,6 +625,39 @@ function runUv(
   })
 }
 
+/** uv's words for copying an interpreter from its install mirror. */
+const PYTHON_DOWNLOAD_LINE = /^ *Download(?:ing|ed) cpython-/
+
+/**
+ * A progress relay for the wheelhouse's interpreter step. Its mirror is the
+ * wheelhouse's `python/` folder on disk, but uv words the copy as a download
+ * ("Downloading cpython-…", "Downloaded cpython-…"), and the setup window would
+ * show it as one. Those lines are dropped and the rest passed on. Whole lines
+ * only: a chunk's unfinished last line is held until its end arrives, or `flush`.
+ */
+export function withoutPythonDownloadLines(onProgress?: (line: string) => void): {
+  relay: (chunk: string) => void
+  flush: () => void
+} {
+  let held = ''
+  const pass = (text: string) => {
+    const kept = text.split(/(?<=\n)/).filter((line) => !PYTHON_DOWNLOAD_LINE.test(line)).join('')
+    if (kept) onProgress?.(kept)
+  }
+  return {
+    relay(chunk) {
+      const text = held + chunk
+      const end = text.lastIndexOf('\n') + 1
+      held = text.slice(end)
+      if (end) pass(text.slice(0, end))
+    },
+    flush() {
+      if (held) pass(held)
+      held = ''
+    },
+  }
+}
+
 /**
  * Install the locked torch release into the managed env with the backend
  * resolved for THIS machine (`--torch-backend=auto`: uv probes the NVIDIA
@@ -772,7 +805,14 @@ async function setupEnv(o: {
     onProgress?.(`[env-setup] offline install from wheelhouse ${dir}\n`)
     const plan = offlinePlan({ wheelhouse: dir, manifest, envDir, userData: join(envDir, '..'), extras })
     mkdirSync(join(envDir, '..'), { recursive: true })
-    await runUv(projectDir, envDir, plan.python, appVersion, onProgress, plan.env)
+    onProgress?.(`[env-setup] installing Python ${manifest.python} from the wheelhouse
+`)
+    const python = withoutPythonDownloadLines(onProgress)
+    try {
+      await runUv(projectDir, envDir, plan.python, appVersion, python.relay, plan.env)
+    } finally {
+      python.flush()
+    }
     await runUv(projectDir, envDir, plan.venv, appVersion, onProgress, plan.env)
     await runUv(projectDir, envDir, plan.export, appVersion, onProgress, plan.env)
     await runUv(projectDir, envDir, plan.install, appVersion, onProgress, plan.env)

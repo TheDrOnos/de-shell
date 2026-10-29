@@ -25,10 +25,12 @@ import { dirname, join } from 'path'
 import { tmpdir } from 'os'
 import { createHash } from 'crypto'
 import { configureShell } from './config.ts'
+import { parseUvLine } from './envProgress.ts'
 import {
   findUv, resolvePythonEnv, hasNvidiaGpu, readWheelhouse, findWheelhouse,
   wheelhouseCandidates, lockStamp, buildSyncArgs, offlinePlan, effectiveExtras,
   gpuEnvOverride, platformMatches, fileUrl, checkWheelhouseExtras, venvPython, clearBrokenEnv,
+  withoutPythonDownloadLines,
 } from './pythonEnv.ts'
 
 configureShell({
@@ -282,6 +284,44 @@ test('offlinePlan builds the python, venv, export, pip-install sequence', () => 
   assert.equal(plan.install[plan.install.indexOf('--find-links') + 1], join('/wh'))
   assert.equal(plan.install[plan.install.indexOf('-r') + 1], plan.requirementsFile)
   assert.equal(plan.install.at(-1), venvPython(join('/ud', 'python-env')))
+})
+
+/** uv 0.13.4's output for the wheelhouse's interpreter step, piped (de-shell #31). */
+const UV_PYTHON_FROM_MIRROR =
+  'Downloading cpython-3.13.12-windows-x86_64-none (download) (20.7MiB)\n' +
+  ' Downloaded cpython-3.13.12-windows-x86_64-none (download)\n' +
+  'Installed Python 3.13.12 in 1.22s\n' +
+  ' + cpython-3.13.12-windows-x86_64-none\n'
+
+function relayed(chunks: string[]): string {
+  const out: string[] = []
+  const python = withoutPythonDownloadLines((s) => out.push(s))
+  for (const chunk of chunks) python.relay(chunk)
+  python.flush()
+  return out.join('')
+}
+
+test('the wheelhouse interpreter step drops uv\'s download lines and keeps the rest', () => {
+  assert.equal(relayed([UV_PYTHON_FROM_MIRROR]),
+    'Installed Python 3.13.12 in 1.22s\n + cpython-3.13.12-windows-x86_64-none\n')
+})
+
+test('a download line split across chunks is still dropped whole', () => {
+  const cut = UV_PYTHON_FROM_MIRROR.indexOf('(download) (20.7MiB)')
+  assert.equal(relayed([UV_PYTHON_FROM_MIRROR.slice(0, cut), UV_PYTHON_FROM_MIRROR.slice(cut)]),
+    'Installed Python 3.13.12 in 1.22s\n + cpython-3.13.12-windows-x86_64-none\n')
+})
+
+test('an unfinished last line reaches the progress stream at flush', () => {
+  assert.equal(relayed(['error: no Python in the mirror']), 'error: no Python in the mirror')
+})
+
+test('the setup window reads the offline interpreter step as an install, never a download', () => {
+  const lines = ('[env-setup] installing Python 3.13.12 from the wheelhouse\n' +
+    relayed([UV_PYTHON_FROM_MIRROR])).split('\n')
+  const events = lines.map(parseUvLine).filter((e) => e !== null)
+  assert.equal(events[0]?.step, 'Installing Python 3.13.12 from the wheelhouse')
+  assert.deepEqual(events.filter((e) => e.phase === 'downloading'), [])
 })
 
 test('checkWheelhouseExtras names the missing extra', () => {
