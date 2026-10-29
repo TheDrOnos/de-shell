@@ -1,0 +1,1 @@
+An offline install's setup window said it was downloading Python, although the interpreter is copied from the wheelhouse; it now says it is installing Python from the wheelhouse.
